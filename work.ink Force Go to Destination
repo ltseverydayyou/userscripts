@@ -1,0 +1,28 @@
+// ==UserScript==
+// @name         work.ink Force Work.ink "Go to Destination"
+// @match        https://work.ink/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const log = (...args) => console.log('[FORCE BUTTON]:', ...args);
+
+    const tryForceButton = () => {
+        const btn = document.querySelector('#access-offers');
+        if (btn) {
+            btn.disabled = false;
+            btn.style.pointerEvents = 'auto';
+            btn.style.opacity = '1';
+            btn.click();
+            log('Clicked "Go to Destination" forcibly');
+        } else {
+            log('Button not found yet');
+        }
+    };
+
+    window.addEventListener('load', () => {
+        setTimeout(tryForceButton, 5000); // Give page time to load
+    });
+})();

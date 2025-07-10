@@ -1,0 +1,45 @@
+// ==UserScript==
+// @name         Work.ink Auto Bypass & Redirect
+// @match        *://work.ink/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const observer = new MutationObserver(() => {
+        const btn = document.querySelector('.accessBtn');
+        if (!btn || btn.classList.contains('button-disabled')) return;
+
+        // Check if link is inside JS or meta
+        const scripts = Array.from(document.scripts);
+        let foundLink = null;
+
+        for (const script of scripts) {
+            const match = script.innerText.match(/window\.location\.href\s*=\s*['"]([^'"]+)['"]/);
+            if (match) {
+                foundLink = match[1];
+                break;
+            }
+        }
+
+        if (foundLink) {
+            console.log('[Bypass] Forcing redirect:', foundLink);
+            window.location.href = foundLink;
+        } else {
+            // Try click anyway
+            btn.click();
+        }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Some sites delay activation with setTimeout
+    setInterval(() => {
+        const btn = document.querySelector('.accessBtn');
+        if (btn && btn.classList.contains('button-disabled') === false) {
+            btn.click();
+        }
+    }, 1500);
+})();
