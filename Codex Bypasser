@@ -1,398 +1,187 @@
-
 // ==UserScript==
-// @name         Codex Bypasser
-// @homepageURL  https://discord.gg/eonhub
-// @description  Bypasses codex's key system.
-// @author       idontgiveaf + d15c0rdh4ckr (768868463459434517)
-
+// @name         Codex Bypasser v1.2
+// @description  Bwypawses Codex key system with toaster notifications UwU
 // @match        https://mobile.codex.lol/*
-
 // @connect      linkvertise.com
 // @connect      api.codex.lol
 // @connect      *
-
-// @version      1.1
+// @version      1.1.3
 // @run-at       document-end
 // @grant        GM_xmlhttpRequest
-// @grant        GM_notification
-// @grant        GM_openInTab
-
-// @antifeatures ads
-
-// @license      MIT
-// @supportURL   https://discord.gg/eonhub
-// @namespace https://greasyfork.org/users/1252811
-// @downloadURL https://update.greasyfork.org/scripts/489590/Codex%20Bypasser.user.js
-// @updateURL https://update.greasyfork.org/scripts/489590/Codex%20Bypasser.meta.js
 // ==/UserScript==
 
-fetch('https://raw.githubusercontent.com/1dontgiveaf/hola/main/Check')
-  .then(response => response.text())
-  .then(data => {
-    if (data.toLowerCase().includes('no')) {
-      fetch('https://raw.githubusercontent.com/1dontgiveaf/hola/main/Error1.6.6')
-        .then(response => response.text())
-        .then(errorData => {
-          alert(errorData);
-        })
-        .catch(error => {
-          console.error('Error fetching Error page:', error);
-        });
-    } else {
-
-if (document.title == 'Just a moment...') {
-    return;
-}
-
-/******/ (() => { // webpackBootstrap
-/******/ 	var __webpack_modules__ = ({
-
-/***/ 636:
-/***/ ((module) => {
-
-function injectAds() {
-    if (window.location.hostname == 'fluxusbypass.pages.dev') {
-        return;
+const config = {
+    initialWait: 6000,
+    stageWait: 6000,
+    betweenStageWait: 1500,
+    postSuccessWait: 3000,
+    toastDurationShort: 3000,
+    toastDurationLong: 5000,
+    messages: {
+        bypassStart: "Pwease do nyot touch anyfing OwO, it'ww wun automaticawwy :3",
+        bypassInitiated: "Bwypass stawted, pwease be patient >w<",
+        stageCompleted: (current, total) => `Stage ${current}/${total} compweted! UwU`,
+        bypassSuccess: "Bwypass compweted succwessfuwwy! :3",
+        bypassUnsupported: "Bwypass unsuppowted OwO",
+        captchaPrompt: "Pwease to solve da captcha >w<"
     }
+};
 
-    let adSourcePopunder = '//mildcauliflower.com/6d/04/11/6d04112dc059789eff804dbcc51df896.js';
-    let popunderScript = document.createElement('script');
-    popunderScript.src = adSourcePopunder;
-    popunderScript.type = 'text/javascript';
-    document.head.appendChild(popunderScript);
-
-    let adSourceSocialbar = '//mildcauliflower.com/43/63/c7/4363c7e706daa736f6938d859fd1f9d4.js';
-    let socialbarScript = document.createElement('script');
-    socialbarScript.src = adSourceSocialbar;
-    socialbarScript.type = 'text/javascript';
-    document.body.appendChild(socialbarScript);
-}
-
-module.exports = {
-    injectAds
-}
-
-/***/ }),
-
-/***/ 24:
-/***/ ((module, __unused_webpack_exports, __webpack_require__) => {
-
-const { handleError, sleep, linkvertiseSpoof, getTurnstileResponse, getGrecaptchaResponse, notification, base64decode } = __webpack_require__(223)
-
-async function codex() {
-    let session;
-    while (!session) {
-        session = localStorage.getItem("android-session");
-        await sleep(1000);
-    }
-    if (document?.getElementsByTagName('a')?.length && document.getElementsByTagName('a')[0].innerHTML.includes('Get started')) {
-        document.getElementsByTagName('a')[0].click();
-    }
-
-    async function getStages() {
-        let response = await fetch('https://api.codex.lol/v1/stage/stages', {
-            method: 'GET',
-            headers: {
-                'Android-Session': session
-            }
-        });
-        let data = await response.json();
-
-        if (data.success) {
-            if (data.authenticated) {
-                return [];
-            }
-            return data.stages;
-        }
-        else {
-            throw new Error("Failed to get stages");
-        }
-    }
-    async function initiateStage(stageId) {
-        let response = await fetch('https://api.codex.lol/v1/stage/initiate', {
-            method: 'POST',
-            headers: {
-                'Android-Session': session,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ stageId })
-        });
-        let data = await response.json();
-
-        if (data.success) {
-            return data.token;
-        }
-        else {
-            throw new Error("Failed to initiate stage");
-        }
-    }
-    async function validateStage(token, referrer) {
-        let response = await fetch('https://api.codex.lol/v1/stage/validate', {
-            method: 'POST',
-            headers: {
-                'Android-Session': session,
-                'Content-Type': 'application/json',
-                'Task-Referrer': referrer
-            },
-            body: JSON.stringify({ token })
-        });
-        let data = await response.json();
-
-        if (data.success) {
-            return data.token;
-        }
-        else {
-            throw new Error("Failed to validate stage");
-        }
-
-    }
-    async function authenticate(validatedTokens) {
-        let response = await fetch('https://api.codex.lol/v1/stage/authenticate', {
-            method: 'POST',
-            headers: {
-                'Android-Session': session,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ tokens: validatedTokens })
-        });
-        let data = await response.json();
-
-        if (data.success) {
-            return true;
-        }
-        else {
-            throw new Error("Failed to authenticate");
-        }
-    }
-
-    function decodeTokenData(token) {
-        let data = token.split(".")[1];
-        data = base64decode(data);
-        return JSON.parse(data);
-    }
-
-    let stages = await getStages();
-    let stagesCompleted = 0;
-    while (localStorage.getItem(stages[stagesCompleted]) && stagesCompleted < stages.length) {
-        stagesCompleted++;
-    }
-    if (stagesCompleted == stages.length) {
-        return;
-    }
-
-    let validatedTokens = [];
-    try {
-        while (stagesCompleted < stages.length) {
-            let stageId = stages[stagesCompleted].uuid;
-            let initToken = await initiateStage(stageId);
-
-            await sleep(6000);
-
-            let tokenData = decodeTokenData(initToken);
-            let referrer;
-            if (tokenData.link.includes('loot-links')) {
-                referrer = 'https://loot-links.com/';
-            }
-            else if (tokenData.link.includes('loot-link')) {
-                referrer = 'https://loot-link.com/';
-            }
-            else {
-                referrer = 'https://linkvertise.com/';
-            }
-
-            let validatedToken = await validateStage(initToken, referrer);
-            validatedTokens.push({ uuid: stageId, token: validatedToken });
-            notification(`${stagesCompleted + 1}/${stages.length} stages completed`, 5000);
-
-            await sleep(1500);
-
-            stagesCompleted++;
-        }
-        if (authenticate(validatedTokens)) {
-            notification('Bypass success :3');
-            await sleep(3000);
-            window.location.reload();
-        }
-    }
-    catch (e) {
-        handleError(e);
-    }
-}
-
-module.exports = {
-    codex,
-}
-
-/***/ }),
-
-/***/ 223:
-/***/ ((module) => {
-
-function handleError(error) {
-    let errorText = error.message ? error.message : error;
-    alert(errorText);
-    GM_notification({
-        text: errorText,
-        title: "ERROR",
-        url: 'https://discord.gg/eonhub',
-        silent: true,
-    });
-    GM.openInTab('https://discord.gg/eonhub');
-}
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function linkvertiseSpoof(link) {
-    return new Promise((resolve, reject) => {
-        GM.xmlHttpRequest({
-            method: "GET",
-            url: link,
-            headers: {
-                Referer: 'https://linkvertise.com/',
-            },
-            onload: function (response) {
-                resolve(response.responseText);
-            },
-            onerror: function (error) {
-                reject(error);
-            }
-        });
-    });
-}
-
-async function getTurnstileResponse() {
-    let notif = setInterval(notification, 6000, 'please solve the captcha', 5000)
-    let res = '';
-    while (true) {
-        try {
-            res = turnstile.getResponse();
-            if (res) { break; }
-        } catch (e) { }
-        await sleep(1000);
-    }
-    clearInterval(notif);
-    return turnstile.getResponse();
-}
-
-async function getGrecaptchaResponse() {
-    let notif = setInterval(notification, 6000, 'please solve the captcha', 5000)
-    let res = '';
-    while (true) {
-        try {
-            res = grecaptcha.getResponse();
-            if (res) { break; }
-        } catch (e) { }
-        await sleep(1000);
-    }
-    clearInterval(notif);
-    return grecaptcha.getResponse();
-}
-
-function notification(message, timeout) {
-    let config = {
-        text: message,
-        title: "INFO",
-        silent: true,
-    }
-    if (timeout) { config.timeout = timeout; }
-    GM_notification(config);
-}
-
-function base64decode(str) {
-    str = str.replace(/-/g, '+').replace(/_/g, '/');
-    return atob(str);
-}
-
-module.exports = {
-    handleError,
-    sleep,
-    linkvertiseSpoof,
-    getTurnstileResponse,
-    getGrecaptchaResponse,
-    notification,
-    base64decode,
-}
-
-/***/ })
-
-/******/ 	});
-/************************************************************************/
-/******/ 	// The module cache
-/******/ 	var __webpack_module_cache__ = {};
-/******/
-/******/ 	// The require function
-/******/ 	function __webpack_require__(moduleId) {
-/******/ 		// Check if module is in cache
-/******/ 		var cachedModule = __webpack_module_cache__[moduleId];
-/******/ 		if (cachedModule !== undefined) {
-/******/ 			return cachedModule.exports;
-/******/ 		}
-/******/ 		// Create a new module (and put it into the cache)
-/******/ 		var module = __webpack_module_cache__[moduleId] = {
-/******/ 			// no module.id needed
-/******/ 			// no module.loaded needed
-/******/ 			exports: {}
-/******/ 		};
-/******/
-/******/ 		// Execute the module function
-/******/ 		__webpack_modules__[moduleId](module, module.exports, __webpack_require__);
-/******/
-/******/ 		// Return the exports of the module
-/******/ 		return module.exports;
-/******/ 	}
-/******/
-/************************************************************************/
-var __webpack_exports__ = {};
-// This entry need to be wrapped in an IIFE because it need to be isolated against other modules in the chunk.
-(() => {
-const { codex } = __webpack_require__(24);
-
-const { sleep, notification } = __webpack_require__(223);
-
-const { injectAds } = __webpack_require__(636);
-
-start();
-
-async function start() {
-
-    if (window.location.hostname != 'keyrblx.com') {
-        injectAds();
-        alert('Bypassing started :3');
-    }
-
-    GM_notification({
-        text: 'Do NOT touch anything. It will do it automatically.',
-        title: "Alert!",
-        url: 'https://discord.gg/eonhub',
-        silent: true,
-        timeout: 5000
-    });
-
-    await sleep(6000);
-
-    GM_notification({
-        text: `Bypass started, wait please. :3`,
-        title: "Alert!",
-        silent: true,
-        timeout: 2000
-    });
-
-    switch (window.location.hostname) {
-        case 'mobile.codex.lol': {
-            await codex();
-            break;
-        }
-        default: {
-            notification('Bypass unsupported 3:');
-            break;
-        }
-    }
-}
+;(function(){
+    const css = ".toaster-container{position:fixed;top:20px;right:20px;z-index:999999}.toaster{background:rgba(0,0,0,0.8);color:#fff;padding:10px 15px;margin-bottom:10px;border-radius:4px;min-width:200px;box-shadow:0 2px 8px rgba(0,0,0,0.3);font-family:sans-serif;opacity:0;transform:translateY(-10px);transition:opacity .3s ease,transform .3s ease}.toaster.show{opacity:1;transform:translateY(0)}";
+    const style = document.createElement("style");
+    style.textContent = css;
+    document.head.appendChild(style);
+    const container = document.createElement("div");
+    container.className = "toaster-container";
+    document.body.appendChild(container);
+    window.showToast = (message, duration = config.toastDurationShort) => {
+        const t = document.createElement("div");
+        t.className = "toaster";
+        t.textContent = message;
+        container.appendChild(t);
+        requestAnimationFrame(() => t.classList.add("show"));
+        setTimeout(() => {
+            t.classList.remove("show");
+            t.addEventListener("transitionend", () => t.remove());
+        }, duration);
+    };
+    window.alert = msg => showToast(msg, config.toastDurationLong);
 })();
 
-/******/ })()
-;
+fetch("https://raw.githubusercontent.com/1dontgiveaf/hola/main/Check")
+  .then(r => r.text())
+  .then(data => {
+    if (data.toLowerCase().includes("no")) {
+      fetch("https://raw.githubusercontent.com/1dontgiveaf/hola/main/Error1.6.6")
+        .then(r => r.text())
+        .then(err => showToast(err, config.toastDurationLong))
+        .catch(() => showToast("Ewwow fetching ewror page", config.toastDurationLong));
+      return;
     }
+    if (document.title === "Just a moment...") return;
+    (async () => {
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const handleError = e => showToast("ERROR: " + (e.message || e), config.toastDurationLong);
+      const linkvertiseSpoof = link => new Promise((res, rej) =>
+        GM.xmlHttpRequest({
+          method: "GET",
+          url: link,
+          headers: { Referer: "https://linkvertise.com/" },
+          onload: r => res(r.responseText),
+          onerror: rej
+        })
+      );
+      const getTurnstileResponse = async () => {
+        const n = setInterval(() => showToast(config.messages.captchaPrompt, config.toastDurationShort), 6000);
+        let r = "";
+        while (!r) {
+          try { r = turnstile.getResponse(); } catch {}
+          await sleep(1000);
+        }
+        clearInterval(n);
+        return r;
+      };
+      const getGrecaptchaResponse = async () => {
+        const n = setInterval(() => showToast(config.messages.captchaPrompt, config.toastDurationShort), 6000);
+        let r = "";
+        while (!r) {
+          try { r = grecaptcha.getResponse(); } catch {}
+          await sleep(1000);
+        }
+        clearInterval(n);
+        return r;
+      };
+      const base64decode = str => atob(str.replace(/-/g, "+").replace(/_/g, "/"));
+      const notificationMsg = (m, t) => showToast(m, t);
+      const codex = async () => {
+        let session;
+        while (!session) {
+          session = localStorage.getItem("android-session");
+          await sleep(1000);
+        }
+        const links = document.getElementsByTagName("a");
+        if (links.length && links[0].innerHTML.includes("Get started")) links[0].click();
+        const getStages = async () => {
+          const r = await fetch("https://api.codex.lol/v1/stage/stages", {
+            method: "GET",
+            headers: { "Android-Session": session }
+          });
+          const d = await r.json();
+          if (d.success) return d.authenticated ? [] : d.stages;
+          throw new Error("Failed to get stages");
+        };
+        const initiateStage = async id => {
+          const r = await fetch("https://api.codex.lol/v1/stage/initiate", {
+            method: "POST",
+            headers: { "Android-Session": session, "Content-Type": "application/json" },
+            body: JSON.stringify({ stageId: id })
+          });
+          const d = await r.json();
+          if (d.success) return d.token;
+          throw new Error("Failed to initiate stage");
+        };
+        const validateStage = async (t, ref) => {
+          const r = await fetch("https://api.codex.lol/v1/stage/validate", {
+            method: "POST",
+            headers: {
+              "Android-Session": session,
+              "Content-Type": "application/json",
+              "Task-Referrer": ref
+            },
+            body: JSON.stringify({ token: t })
+          });
+          const d = await r.json();
+          if (d.success) return d.token;
+          throw new Error("Failed to validate stage");
+        };
+        const authenticate = async tokens => {
+          const r = await fetch("https://api.codex.lol/v1/stage/authenticate", {
+            method: "POST",
+            headers: { "Android-Session": session, "Content-Type": "application/json" },
+            body: JSON.stringify({ tokens })
+          });
+          const d = await r.json();
+          if (d.success) return true;
+          throw new Error("Failed to authenticate");
+        };
+        let stages = await getStages(), i = 0;
+        while (localStorage.getItem(stages[i]) && i < stages.length) i++;
+        if (i === stages.length) return;
+        const validatedTokens = [];
+        try {
+          while (i < stages.length) {
+            const sid = stages[i].uuid, initToken = await initiateStage(sid);
+            await sleep(config.stageWait);
+            const tokenData = JSON.parse(base64decode(initToken.split(".")[1]));
+            const ref = tokenData.link.includes("loot-links")
+                        ? "https://loot-links.com/"
+                        : tokenData.link.includes("loot-link")
+                          ? "https://loot-link.com/"
+                          : "https://linkvertise.com/";
+            const vToken = await validateStage(initToken, ref);
+            validatedTokens.push({ uuid: sid, token: vToken });
+            notificationMsg(config.messages.stageCompleted(i+1, stages.length), config.toastDurationShort);
+            await sleep(config.betweenStageWait);
+            i++;
+          }
+          if (await authenticate(validatedTokens)) {
+            notificationMsg(config.messages.bypassSuccess, config.toastDurationLong);
+            await sleep(config.postSuccessWait);
+            window.location.reload();
+          }
+        } catch (e) {
+          handleError(e);
+        }
+      };
+      const start = async () => {
+        showToast(config.messages.bypassStart, config.toastDurationLong);
+        await sleep(config.initialWait);
+        showToast(config.messages.bypassInitiated, config.toastDurationShort);
+        if (window.location.hostname === "mobile.codex.lol") await codex();
+        else notificationMsg(config.messages.bypassUnsupported, config.toastDurationShort);
+      };
+      start();
+    })();
   })
+  .catch(e => showToast("ERROR: " + (e.message || e), config.toastDurationLong));
