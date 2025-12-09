@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Търсач на медийни линкове (мрежови hook + Zoom)
+// @name         Търсач на медийни линкове (Zoom + мрежов hook)
 // @namespace    http://tampermonkey.net/
-// @version      0.4
-// @description  Открива mp3/mp4/m3u8 и др. чрез DOM + мрежови hook, показва известие и отваря отделен таб със списък
+// @version      0.3
+// @description  Открива mp3/mp4/m3u8 и др. чрез DOM + мрежови заявки, показва нотификация и отваря страница със списък с линкове
 // @author       you
 // @match        *://*/*
 // @run-at       document-start
@@ -106,21 +106,17 @@
     }
 
     function notify(count) {
-        let text;
-        if (count === 1) {
-            text = 'Открит е 1 медиен линк.';
-        } else {
-            text = 'Открити са ' + count + ' медийни линка.';
-        }
-
+        const text = count === 1
+            ? 'Намерен е 1 медиен линк.'
+            : 'Намерени са ' + count + ' медийни линка.';
         if (typeof GM_notification === 'function') {
             GM_notification({
-                title: 'Търсач на медия',
+                title: 'Откриване на медия',
                 text: text,
                 timeout: 4000
             });
         } else if (window.Notification && Notification.permission === 'granted') {
-            new Notification('Търсач на медия', { body: text });
+            new Notification('Откриване на медия', { body: text });
         } else {
             alert(text);
         }
@@ -134,10 +130,9 @@
     }
 
     function openResultsPage(urls) {
-        const current = window;
-        const w = current.open('about:blank', '_blank', 'noopener');
+        const w = window.open('about:blank', '_blank');
         if (!w) {
-            alert('Търсач на медия: блокиран е изскачащ прозорец. Разрешете попъпите за сайта, за да видите списъка.');
+            alert('Media Finder: изскачащият прозорец е блокиран. Разрешете pop-up прозорци за този сайт, за да видите списъка.');
             return;
         }
 
@@ -155,19 +150,14 @@
 'a{color:#38bdf8;word-break:break-all;}' +
 'h1{font-size:18px;margin:0 0 8px 0;}' +
 '</style></head><body>' +
-'<h1>Открити са ' + urls.length + ' медийни URL адреса</h1>' +
-'<p>Може да копирате линк или да го отворите в нов таб. За .m3u8 плейлисти използвайте подходящ плейър или downloader.</p>' +
+'<h1>Намерени са ' + urls.length + ' медийни линка</h1>' +
+'<p>Копирайте линк или го отворете в нов раздел. За .m3u8 HLS плейлисти използвайте съвместим плеър или програма за изтегляне.</p>' +
 '<ul>' + items + '</ul>' +
 '</body></html>';
 
         w.document.open();
         w.document.write(html);
         w.document.close();
-
-        try {
-            w.blur();
-            current.focus();
-        } catch(e) {}
     }
 
     function hookNetwork() {
