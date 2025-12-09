@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Търсач на медийни линкове (Zoom + мрежов hook)
+// @name         Media URL Finder (network hook + Zoom friendly)
 // @namespace    http://tampermonkey.net/
 // @version      0.3
-// @description  Открива mp3/mp4/m3u8 и др. чрез DOM + мрежови заявки, показва нотификация и отваря страница със списък с линкове
+// @description  Detect mp3/mp4/m3u8/etc via DOM + network hooks, notify and open a page with links
 // @author       you
 // @match        *://*/*
 // @run-at       document-start
@@ -106,17 +106,15 @@
     }
 
     function notify(count) {
-        const text = count === 1
-            ? 'Намерен е 1 медиен линк.'
-            : 'Намерени са ' + count + ' медийни линка.';
+        const text = count === 1 ? 'Found 1 media URL.' : 'Found ' + count + ' media URLs.';
         if (typeof GM_notification === 'function') {
             GM_notification({
-                title: 'Откриване на медия',
+                title: 'Media Finder',
                 text: text,
                 timeout: 4000
             });
         } else if (window.Notification && Notification.permission === 'granted') {
-            new Notification('Откриване на медия', { body: text });
+            new Notification('Media Finder', { body: text });
         } else {
             alert(text);
         }
@@ -132,7 +130,7 @@
     function openResultsPage(urls) {
         const w = window.open('about:blank', '_blank');
         if (!w) {
-            alert('Media Finder: изскачащият прозорец е блокиран. Разрешете pop-up прозорци за този сайт, за да видите списъка.');
+            alert('Media Finder: popup blocked, allow popups for this site to see the list.');
             return;
         }
 
@@ -144,14 +142,14 @@
         const html =
 '<!doctype html>' +
 '<html><head><meta charset="utf-8">' +
-'<title>Медийни линкове</title>' +
+'<title>Media URLs</title>' +
 '<style>' +
 'body{background:#020617;color:#e5e7eb;font:13px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:10px;}' +
 'a{color:#38bdf8;word-break:break-all;}' +
 'h1{font-size:18px;margin:0 0 8px 0;}' +
 '</style></head><body>' +
-'<h1>Намерени са ' + urls.length + ' медийни линка</h1>' +
-'<p>Копирайте линк или го отворете в нов раздел. За .m3u8 HLS плейлисти използвайте съвместим плеър или програма за изтегляне.</p>' +
+'<h1>Found ' + urls.length + ' media URL' + (urls.length === 1 ? '' : 's') + '</h1>' +
+'<p>Copy a link or open it in a new tab. For .m3u8 HLS playlists, you can use a compatible player or downloader.</p>' +
 '<ul>' + items + '</ul>' +
 '</body></html>';
 
