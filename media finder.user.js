@@ -1,12 +1,11 @@
 // ==UserScript==
-// @name         Откриване на медийни адреси (Zoom-friendly, с бутон)
+// @name         Откриване на медийни адреси (балон-нотификация)
 // @namespace    http://tampermonkey.net/
-// @version      0.5bg
-// @description  Открива mp3/mp4/m3u8 и др. чрез DOM + мрежови заявки, пита дали да отвори списък и показва бутон "Медии (N)"
+// @version      0.7bg
+// @description  Открива mp3/mp4/m3u8/ts и Zoom /rec/download|play линкове и показва стандартно браузърно уведомление с линковете + бутон "Медии (N)"
 // @author       you
 // @match        *://*/*
 // @run-at       document-start
-// @grant        GM_notification
 // @grant        unsafeWindow
 // ==/UserScript==
 
@@ -17,20 +16,18 @@
 
     const exts = [
         'mp3','mp4','m4a','m4v','webm','ogg','ogv','oga',
-        'wav','flac','mov','avi','mkv','flv','m3u8'
+        'wav','flac','mov','avi','mkv','flv','m3u8','ts'
     ];
     const extRe = new RegExp('\\.(' + exts.join('|') + ')(\\?|#|$)', 'i');
 
     const found = new Set();
-    let promptTimer = null;
-    let prompted = false;
+    let notifyTimer = null;
+    let notified = false;
     let badgeEl = null;
 
     function log() {
         if (!DEBUG) return;
-        try {
-            console.log('[Търсач на медии]', ...arguments);
-        } catch(e) {}
+        try { console.log('[Търсач на медии]', ...arguments); } catch(e) {}
     }
 
     function normalizeUrl(u) {
@@ -52,22 +49,38 @@
         return u;
     }
 
+    function isZoomMedia(url) {
+        try {
+            const u = new URL(url);
+            if (!u.hostname.includes('zoom.us')) return false;
+            if (u.pathname.includes('/rec/download')) return true;
+            if (u.pathname.includes('/rec/play')) return true;
+            return false;
+        } catch(e) {
+            return false;
+        }
+    }
+
     function tryAddUrl(raw) {
         if (!raw) return;
         const url = normalizeUrl(raw);
         if (!url) return;
-        if (!extRe.test(url)) return;
+
+        if (!extRe.test(url) && !isZoomMedia(url)) {
+            return;
+        }
+
         if (found.has(url)) return;
         found.add(url);
         log('Засечен адрес:', url, 'Общо:', found.size);
         updateBadge();
-        schedulePrompt();
+        scheduleNotification();
     }
 
     function scanTextForUrls(text) {
         if (!text) return;
         try {
-            const re = /(?:https?:)?\/\/[^\s"'<>]+\.(?:mp3|mp4|m4a|m4v|webm|ogg|ogv|oga|wav|flac|mov|avi|mkv|flv|m3u8)(\?[^\s"'<>]*)?/gi;
+            const re = /(?:https?:)?\/\/[^\s"'<>]+\.(?:mp3|mp4|m4a|m4v|webm|ogg|ogv|oga|wav|flac|mov|avi|mkv|flv|m3u8|ts)(\?[^\s"'<>]*)?/gi;
             let m;
             while ((m = re.exec(text))) {
                 let u = m[0];
@@ -76,77 +89,89 @@
                 }
                 tryAddUrl(u);
             }
+
+            const zoomRe = /https?:\/\/[^\s"'<>]*zoom\.us\/rec\/(?:download|play)[^\s"'<>]*/gi;
+            while ((m = zoomRe.exec(text))) {
+                tryAddUrl(m[0]);
+            }
         } catch(e) {
             log('Грешка при scanTextForUrls:', e);
         }
     }
 
-    function schedulePrompt() {
-        if (prompted) return;
-        if (promptTimer) return;
-        promptTimer = setTimeout(function() {
+    function scheduleNotification() {
+        if (notified) return;
+        if (notifyTimer) return;
+        notifyTimer = setTimeout(function() {
             const arr = Array.from(found);
             if (!arr.length) return;
-            prompted = true;
-            showPrompt(arr);
-        }, 2000);
+            showNotification(arr);
+        }, 1500);
     }
 
-    function showPrompt(urls) {
+    function showNotification(urls) {
+        notified = true;
         const count = urls.length;
-        const msg = count === 1
-            ? 'Намерен е 1 медиен адрес. Да се отвори ли списъкът в нов раздел?'
-            : 'Намерени са ' + count + ' медийни адреса. Да се отвори ли списъкът в нов раздел?';
 
-        log('Показване на диалог:', msg);
+        let body = '';
+        if (count === 1) {
+            body = 'Намерен медиен адрес:\n' + urls[0];
+        } else {
+            body = 'Намерени са ' + count + ' медийни адреса.\n';
+            const preview = urls.slice(0, 3);
+            body += preview.join('\n');
+            if (count > 3) {
+                body += '\n+ още ' + (count - 3);
+            }
+        }
 
-        if (typeof GM_notification === 'function') {
-            GM_notification({
-                title: 'Търсач на медии',
-                text: msg + ' (Кликнете, за да отворите списъка.)',
-                timeout: 8000,
-                onclick: function() {
-                    openResultsPage(urls);
-                }
-            });
-        } else if (window.Notification) {
-            if (Notification.permission === 'granted') {
-                const n = new Notification('Търсач на медии', {
-                    body: msg + ' Кликнете, за да отворите списъка.'
-                });
+        log('Опит за показване на браузърно уведомление:', body);
+
+        if (!('Notification' in window)) {
+            alertFallback(urls, count);
+            return;
+        }
+
+        function showBubble() {
+            try {
+                const n = new Notification('Търсач на медии', { body });
                 n.onclick = function() {
                     try { window.focus(); } catch(e) {}
                     openResultsPage(urls);
+                    n.close();
                 };
-            } else if (Notification.permission === 'default') {
-                Notification.requestPermission().then(function(p) {
-                    if (p === 'granted') {
-                        const n2 = new Notification('Търсач на медии', {
-                            body: msg + ' Кликнете, за да отворите списъка.'
-                        });
-                        n2.onclick = function() {
-                            try { window.focus(); } catch(e) {}
-                            openResultsPage(urls);
-                        };
-                    } else {
-                        if (confirm(msg)) {
-                            openResultsPage(urls);
-                        }
-                    }
-                }).catch(function() {
-                    if (confirm(msg)) {
-                        openResultsPage(urls);
-                    }
-                });
-            } else {
-                if (confirm(msg)) {
-                    openResultsPage(urls);
+            } catch(e) {
+                log('Грешка при показване на Notification:', e);
+                alertFallback(urls, count);
+            }
+        }
+
+        if (Notification.permission === 'granted') {
+            showBubble();
+        } else if (Notification.permission === 'default') {
+            Notification.requestPermission().then(function(p) {
+                if (p === 'granted') {
+                    showBubble();
+                } else {
+                    alertFallback(urls, count);
                 }
-            }
+            }).catch(function() {
+                alertFallback(urls, count);
+            });
         } else {
-            if (confirm(msg)) {
-                openResultsPage(urls);
-            }
+            alertFallback(urls, count);
+        }
+    }
+
+    function alertFallback(urls, count) {
+        let msg;
+        if (count === 1) {
+            msg = 'Намерен е 1 медиен адрес.\n\n' + urls[0] + '\n\nДа се отвори ли списъкът в нов раздел?';
+        } else {
+            msg = 'Намерени са ' + count + ' медийни адреса.\n\nДа се отвори ли списъкът в нов раздел?';
+        }
+        if (confirm(msg)) {
+            openResultsPage(urls);
         }
     }
 
@@ -188,7 +213,7 @@
     ? 'Намерен е 1 медиен адрес'
     : 'Намерени са ' + urls.length + ' медийни адреса') +
 '</h1>' +
-'<p>Копирайте адрес или го отворете в нов раздел. За плейлисти .m3u8 използвайте съвместим плейър или програма за изтегляне.</p>' +
+'<p>Копирайте адрес или го отворете в нов раздел. За плейлисти .m3u8/.ts използвайте съвместим плейър или програма за изтегляне.</p>' +
 '<ul>' + items + '</ul>' +
 '</body></html>';
 
@@ -267,7 +292,7 @@
 
     function initialScan() {
         if (!document.documentElement) return;
-        log('Начален скен...');
+        log('Начален скен на', location.href);
         collectFromDom();
         collectFromHtml();
     }
@@ -283,7 +308,6 @@
                 const origOpen = XHR.prototype.open;
                 XHR.prototype.open = function(method, url) {
                     try {
-                        // URL на заявката
                         tryAddUrl(url);
                     } catch(e) {
                         log('Грешка в XHR.open tryAddUrl:', e);
@@ -294,7 +318,6 @@
                             if (this.responseURL) {
                                 tryAddUrl(this.responseURL);
                             }
-                            // Ако отговорът е текст, гледаме за вградени линкове
                             if ((this.responseType === '' || this.responseType === 'text') && this.responseText) {
                                 scanTextForUrls(this.responseText);
                             }
@@ -329,6 +352,9 @@
                             if (res && res.url) {
                                 tryAddUrl(res.url);
                             }
+                            res.clone().text().then(function(t) {
+                                scanTextForUrls(t);
+                            }).catch(function(){});
                         } catch(e) {
                             log('Грешка в fetch then:', e);
                         }
@@ -342,7 +368,6 @@
         }
     }
 
-    // Старт
     log('Скриптът стартира на', location.href);
     hookNetwork();
 
