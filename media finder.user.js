@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Media URL Finder (network hook + Zoom friendly)
 // @namespace    http://tampermonkey.net/
-// @version      0.3
-// @description  Detect mp3/mp4/m3u8/etc via DOM + network hooks, notify and open a page with links
+// @version      0.4
+// @description  Detect mp3/mp4/m3u8/etc via DOM + network hooks, notify and open a background tab with links
 // @author       you
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_notification
+// @grant        GM_openInTab
 // @grant        unsafeWindow
 // ==/UserScript==
 
@@ -128,12 +129,6 @@
     }
 
     function openResultsPage(urls) {
-        const w = window.open('about:blank', '_blank');
-        if (!w) {
-            alert('Media Finder: popup blocked, allow popups for this site to see the list.');
-            return;
-        }
-
         const items = urls.map(function(u) {
             const e = escHtml(u);
             return '<li><a href="' + e + '" target="_blank" rel="noreferrer noopener">' + e + '</a></li>';
@@ -153,9 +148,17 @@
 '<ul>' + items + '</ul>' +
 '</body></html>';
 
-        w.document.open();
-        w.document.write(html);
-        w.document.close();
+        const blob = new Blob([html], { type: 'text/html' });
+        const url = URL.createObjectURL(blob);
+
+        if (typeof GM_openInTab === 'function') {
+            GM_openInTab(url, { active: false, insert: true, setParent: true });
+        } else {
+            const w = window.open(url, '_blank', 'noopener,noreferrer');
+            if (!w) {
+                alert('Media Finder: popup blocked, allow popups for this site to see the list.');
+            }
+        }
     }
 
     function hookNetwork() {
