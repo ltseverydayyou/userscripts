@@ -6,6 +6,8 @@
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_openInTab
+// @downloadURL  https://github.com/ltseverydayyou/userscripts/raw/main/media%20finder.user.js
+// @updateURL    https://github.com/ltseverydayyou/userscripts/raw/main/media%20finder.meta.js
 // ==/UserScript==
 
 (function () {
