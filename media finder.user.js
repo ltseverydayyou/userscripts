@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Media Finder (stable players + top toast + safe)
+// @name         Media Finder (advanced + clean UI + auto language)
 // @namespace    http://tampermonkey.net/
-// @version      0.8
-// @description  Finds mp3/mp4/m3u8/etc without breaking sites; stable player detection; top toast; opens list on click
+// @version      1.0
+// @description  Advanced mp3/mp4/m3u8/mpd finder: fetch/xhr sniffing + player tracking + clean panel + auto language + toggle
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_openInTab
@@ -11,39 +11,230 @@
 (function () {
   'use strict';
 
-  const exts = ['mp3','mp4','m4a','m4v','webm','ogg','ogv','oga','wav','flac','mov','mkv','avi','flv','m3u8','mpd'];
-  const extRe = new RegExp('\\.(' + exts.join('|') + ')(\\?|#|$)', 'i');
+  const CFG = {
+    maxItems: 2500,
+    maxPlayers: 200,
+    maxReasons: 6,
+    maxFetchBodyBytesForPlaylist: 512 * 1024,
+    scanIntervalMs: 2500,
+    toastAutoHideMs: 0,
+    allowDataUrls: false,
+    allowBlobUrls: true,
+    includeQueryExt: true
+  };
 
-  const found = new Set();
+  const EXT = [
+    'mp3','mp4','m4a','m4v','webm','ogg','ogv','oga','wav','flac','aac','opus',
+    'mov','mkv','avi','flv','m3u8','mpd','ts','m4s','vtt','srt','mka','3gp','3g2'
+  ];
 
-  const pl = new Map();
+  const MIME_OK = [
+    /^audio\//i,
+    /^video\//i,
+    /^application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml|octet-stream)/i,
+    /^text\/(vtt|plain)/i
+  ];
+
+  const PLAYLIST_MIME = [
+    /^application\/(vnd\.apple\.mpegurl|x-mpegurl)/i,
+    /^audio\/(mpegurl|x-mpegurl)/i,
+    /^video\/(mpegurl|x-mpegurl)/i,
+    /^text\/(plain|vtt)/i
+  ];
+
+  const extRe = new RegExp('(\\.|%2E)(' + EXT.join('|') + ')(?=($|[?#&/]))', 'i');
+  const qExtRe = /[?&#](?:file|filename|name|url|src|media|video|audio|download|path)=([^&#]+)/i;
+
+  const found = new Map(); // url -> {ts, from:Set, mime?, size?, note?}
+  const players = new Map(); // el -> {tag, src, last, why:Set}
   const srcSeen = new Set();
 
-  let toastEl = null;
-  let msgEl = null;
-  let btnEl = null;
-  let updT = null;
-  let listUrl = null;
+  let ui = null;
+  let uiOpen = false;
+  let lastToast = 0;
+
+  const LANGS = {
+    en: {
+      title: 'Media Finder',
+      scanning: 'Scanning…',
+      found: 'Found',
+      links: 'link(s)',
+      players: 'Players',
+      open: 'Open',
+      close: 'Close',
+      copy: 'Copy',
+      copyAll: 'Copy all',
+      clear: 'Clear',
+      search: 'Search…',
+      filterAll: 'All',
+      filterAudio: 'Audio',
+      filterVideo: 'Video',
+      filterPlaylists: 'Playlists',
+      filterSubs: 'Subs',
+      filterOther: 'Other',
+      settings: 'Settings',
+      lang: 'Language',
+      auto: 'Auto',
+      newest: 'Newest',
+      oldest: 'Oldest',
+      uniqueFirst: 'Unique first',
+      export: 'Export .txt',
+      openList: 'Open list',
+      tip: 'Tip: press play on the page; HLS/DASH often shows as .m3u8/.mpd.',
+      noneYet: 'No links yet. Press play and wait a second.',
+      clipboardBlocked: 'Clipboard blocked — use Open list',
+      copied: 'Copied',
+      items: 'item(s)',
+      compact: 'Compact',
+      toast: 'Toast',
+      on: 'On',
+      off: 'Off'
+    },
+    bg: {
+      title: 'Търсач на медия',
+      scanning: 'Сканиране…',
+      found: 'Намерени',
+      links: 'линк(а)',
+      players: 'Плейъри',
+      open: 'Отвори',
+      close: 'Затвори',
+      copy: 'Копирай',
+      copyAll: 'Копирай всички',
+      clear: 'Изчисти',
+      search: 'Търсене…',
+      filterAll: 'Всички',
+      filterAudio: 'Аудио',
+      filterVideo: 'Видео',
+      filterPlaylists: 'Плейлисти',
+      filterSubs: 'Субтитри',
+      filterOther: 'Други',
+      settings: 'Настройки',
+      lang: 'Език',
+      auto: 'Авто',
+      newest: 'Най-нови',
+      oldest: 'Най-стари',
+      uniqueFirst: 'Първо уникални',
+      export: 'Експорт .txt',
+      openList: 'Отвори списък',
+      tip: 'Съвет: пусни видео/аудио; HLS/DASH често са .m3u8/.mpd.',
+      noneYet: 'Още няма линкове. Пусни медия и изчакай секунда.',
+      clipboardBlocked: 'Клипбордът е блокиран — ползвай „Отвори списък“',
+      copied: 'Копирани',
+      items: 'елемент(а)',
+      compact: 'Компактно',
+      toast: 'Тост',
+      on: 'Вкл',
+      off: 'Изкл'
+    }
+  };
+
+  const state = {
+    lang: 'auto',
+    filter: 'all',
+    sort: 'newest',
+    query: '',
+    compact: false,
+    toast: true
+  };
+
+  function pickLang() {
+    if (state.lang && state.lang !== 'auto') return state.lang;
+    const nav = (navigator.languages && navigator.languages[0]) || navigator.language || 'en';
+    const base = String(nav).toLowerCase().split('-')[0];
+    return LANGS[base] ? base : 'en';
+  }
+
+  function t(key) {
+    const L = pickLang();
+    return (LANGS[L] && LANGS[L][key]) || (LANGS.en && LANGS.en[key]) || key;
+  }
+
+  function now() { return Date.now(); }
 
   function norm(u) {
     if (!u) return null;
     u = String(u).trim();
     if (!u) return null;
+
+    if (!CFG.allowDataUrls && /^data:/i.test(u)) return null;
+    if (!CFG.allowBlobUrls && /^blob:/i.test(u)) return null;
+
     if (u.startsWith('//')) u = location.protocol + u;
     else if (u.startsWith('/')) u = location.origin + u;
+
     if (!/^https?:|^blob:|^data:/i.test(u)) {
       try { u = new URL(u, location.href).href; } catch { return null; }
     }
     return u;
   }
 
-  function add(raw) {
+  function looksLikeMedia(u) {
+    if (!u) return false;
+    if (extRe.test(u)) return true;
+    if (CFG.includeQueryExt) {
+      const m = u.match(qExtRe);
+      if (m && m[1]) {
+        const dec = safeDecode(m[1]);
+        if (dec && extRe.test(dec)) return true;
+      }
+    }
+    return false;
+  }
+
+  function safeDecode(s) {
+    try { return decodeURIComponent(s); } catch { return s; }
+  }
+
+  function guessType(u, mime) {
+    const lower = String(u || '').toLowerCase();
+    const ct = String(mime || '').toLowerCase();
+
+    if (ct.includes('mpegurl') || lower.includes('.m3u8')) return 'playlist';
+    if (ct.includes('dash+xml') || lower.includes('.mpd')) return 'playlist';
+
+    if (ct.includes('vtt') || lower.includes('.vtt') || lower.includes('.srt')) return 'subs';
+
+    if (ct.startsWith('audio/')) return 'audio';
+    if (ct.startsWith('video/')) return 'video';
+
+    const ext = (lower.match(extRe) || [])[2];
+    if (!ext) return 'other';
+
+    if (['mp3','m4a','wav','flac','aac','opus','oga','ogg'].includes(ext)) return 'audio';
+    if (['mp4','m4v','webm','mov','mkv','avi','flv','3gp','3g2','ogv'].includes(ext)) return 'video';
+    if (['m3u8','mpd','ts','m4s'].includes(ext)) return 'playlist';
+    if (['vtt','srt'].includes(ext)) return 'subs';
+    return 'other';
+  }
+
+  function add(raw, meta) {
     const u = norm(raw);
     if (!u) return;
-    if (!extRe.test(u)) return;
-    if (found.has(u)) return;
-    found.add(u);
-    scheduleUpdate();
+
+    const mime = meta && meta.mime ? String(meta.mime) : '';
+    const okMime = mime ? MIME_OK.some(re => re.test(mime)) : false;
+
+    if (!looksLikeMedia(u) && !okMime) return;
+
+    if (!found.has(u)) {
+      if (found.size >= CFG.maxItems) return;
+      found.set(u, { ts: now(), from: new Set(), mime: mime || '', size: meta?.size || 0, note: meta?.note || '' });
+    }
+
+    const it = found.get(u);
+    if (meta?.from) {
+      it.from.add(meta.from);
+      if (it.from.size > CFG.maxReasons) {
+        const arr = Array.from(it.from).slice(-CFG.maxReasons);
+        it.from = new Set(arr);
+      }
+    }
+    if (mime && !it.mime) it.mime = mime;
+    if (meta?.size && !it.size) it.size = meta.size;
+    if (meta?.note && !it.note) it.note = meta.note;
+
+    scheduleRender();
+    maybeToast();
   }
 
   function getMediaSrc(el) {
@@ -55,239 +246,771 @@
   }
 
   function trackPlayer(el, why) {
-    const t = el?.tagName?.toLowerCase();
-    if (t !== 'video' && t !== 'audio') return;
+    const ttag = el?.tagName?.toLowerCase();
+    if (ttag !== 'video' && ttag !== 'audio') return;
 
     const cur = getMediaSrc(el);
     const src = cur ? (norm(cur) || cur) : '';
 
-    let info = pl.get(el);
+    let info = players.get(el);
     if (!info) {
-      info = { tag: t, why: new Set(), src: '', last: 0 };
-      pl.set(el, info);
+      if (players.size >= CFG.maxPlayers) return;
+      info = { tag: ttag, why: new Set(), src: '', last: 0 };
+      players.set(el, info);
     }
 
     if (why) info.why.add(why);
+    if (info.why.size > CFG.maxReasons) info.why = new Set(Array.from(info.why).slice(-CFG.maxReasons));
 
     if (src && src !== info.src) {
       info.src = src;
-      info.last = Date.now();
+      info.last = now();
 
       if (!srcSeen.has(src)) {
         srcSeen.add(src);
-        add(src);
+        add(src, { from: 'player:' + ttag });
       }
     }
 
-    scheduleUpdate();
+    scheduleRender();
   }
 
   function cleanupPlayers() {
-    const now = Date.now();
-    for (const [el, info] of pl) {
+    const n = now();
+    for (const [el, info] of players) {
       if (!el || !el.isConnected) {
-        pl.delete(el);
+        players.delete(el);
         continue;
       }
-      if (info && info.src && now - (info.last || 0) > 300000) info.last = now;
+      if (info && info.src && n - (info.last || 0) > 10 * 60 * 1000) info.last = n;
     }
-    scheduleUpdate();
   }
 
   function scanDom() {
     try {
       const nodes = document.querySelectorAll('video,audio,source,[src],[href],[data-src],[data-href]');
       nodes.forEach(n => {
-        const t = n.tagName?.toLowerCase();
-        if (t === 'video' || t === 'audio') trackPlayer(n, 'dom');
+        const tg = n.tagName?.toLowerCase();
+        if (tg === 'video' || tg === 'audio') trackPlayer(n, 'dom');
 
         ['src','href','data-src','data-href'].forEach(a => {
           const v = n.getAttribute && n.getAttribute(a);
-          if (v) add(v);
+          if (v) add(v, { from: 'dom:' + a });
         });
       });
     } catch {}
   }
 
   function observeResources() {
-    const take = (name) => add(name);
+    const take = (name, initiatorType) => add(name, { from: 'perf:' + (initiatorType || 'resource') });
 
-    try { performance.getEntriesByType('resource').forEach(e => take(e.name)); } catch {}
+    try {
+      performance.getEntriesByType('resource').forEach(e => take(e.name, e.initiatorType));
+    } catch {}
 
     try {
       const po = new PerformanceObserver(list => {
-        try { for (const e of list.getEntries()) take(e.name); } catch {}
+        try {
+          for (const e of list.getEntries()) take(e.name, e.initiatorType);
+        } catch {}
       });
       po.observe({ type: 'resource', buffered: true });
     } catch {}
   }
 
-  function ensureToast() {
-    if (toastEl) return;
-
-    const make = () => {
-      if (toastEl) return;
-
-      const wrap = document.createElement('div');
-      wrap.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483647;display:flex;justify-content:center;pointer-events:none;';
-
-      const bar = document.createElement('div');
-      bar.style.cssText =
-        'margin:10px;max-width:980px;width:calc(100% - 20px);' +
-        'background:#0b1220;border:1px solid #334155;border-radius:10px;' +
-        'box-shadow:0 10px 30px rgba(0,0,0,.35);' +
-        'padding:10px 12px;display:flex;gap:10px;align-items:center;' +
-        'pointer-events:auto;color:#e5e7eb;font:13px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
-
-      const msg = document.createElement('div');
-      msg.style.cssText = 'flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
-      msg.textContent = 'Media Finder: scanning…';
-
-      const mkBtn = (t) => {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.textContent = t;
-        b.style.cssText = 'background:#111827;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:6px 10px;cursor:pointer;';
-        return b;
-      };
-
-      const open = mkBtn('Open list');
-      open.onclick = () => openList();
-
-      const copy = mkBtn('Copy all');
-      copy.onclick = () => copyAll();
-
-      const x = mkBtn('Dismiss');
-      x.onclick = () => wrap.remove();
-
-      bar.appendChild(msg);
-      bar.appendChild(open);
-      bar.appendChild(copy);
-      bar.appendChild(x);
-      wrap.appendChild(bar);
-
-      document.documentElement.appendChild(wrap);
-
-      toastEl = wrap;
-      msgEl = msg;
-    };
-
-    if (document.documentElement) make();
-    else document.addEventListener('DOMContentLoaded', make, { once: true });
+  function readHeader(headers, key) {
+    try {
+      if (!headers) return '';
+      if (typeof headers.get === 'function') return headers.get(key) || '';
+      return '';
+    } catch { return ''; }
   }
 
-  function ensureCornerBtn() {
-    if (btnEl) return;
+  async function sniffMaybePlaylist(url, mime, resp) {
+    try {
+      if (!resp || !resp.ok) return;
+      const ct = (mime || '').toLowerCase();
+      const isPlaylist = ct.includes('mpegurl') || ct.includes('dash+xml') || /\.m3u8(\b|[?#&/])/i.test(url) || /\.mpd(\b|[?#&/])/i.test(url);
+      const looksText = PLAYLIST_MIME.some(re => re.test(ct)) || isPlaylist;
 
-    const make = () => {
-      if (btnEl) return;
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.textContent = 'Media';
-      b.style.cssText =
-        'position:fixed;right:10px;bottom:10px;z-index:2147483647;' +
-        'background:#0b1220;color:#e5e7eb;border:1px solid #334155;border-radius:10px;' +
-        'padding:8px 10px;cursor:pointer;font:12px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;opacity:.75;';
-      b.onmouseenter = () => b.style.opacity = '1';
-      b.onmouseleave = () => b.style.opacity = '.75';
-      b.onclick = () => { ensureToast(); openList(); };
-      document.documentElement.appendChild(b);
-      btnEl = b;
-    };
+      const len = Number(readHeader(resp.headers, 'content-length')) || 0;
+      if (len && len > CFG.maxFetchBodyBytesForPlaylist) return;
+      if (!looksText) return;
 
-    if (document.documentElement) make();
-    else document.addEventListener('DOMContentLoaded', make, { once: true });
+      const txt = await resp.clone().text();
+      if (!txt) return;
+
+      if (/^\s*#EXTM3U/i.test(txt) || /<MPD[\s>]/i.test(txt) || /#EXT-X/i.test(txt)) {
+        add(url, { from: 'sniff:playlist', mime: mime, note: 'playlist' });
+
+        const base = new URL(url, location.href);
+        const lines = txt.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+
+        for (const ln of lines) {
+          if (!ln || ln.startsWith('#')) continue;
+          if (/^data:/i.test(ln)) continue;
+          let abs = null;
+          try { abs = new URL(ln, base.href).href; } catch { abs = null; }
+          if (abs) add(abs, { from: 'playlist:child' });
+        }
+      }
+    } catch {}
   }
 
-  function scheduleUpdate() {
-    if (updT) return;
-    updT = setTimeout(() => {
-      updT = null;
+  function patchFetch() {
+    if (!window.fetch) return;
+    const orig = window.fetch;
+    window.fetch = function (...args) {
+      let url = '';
+      try {
+        const a0 = args[0];
+        url = typeof a0 === 'string' ? a0 : (a0 && a0.url) || '';
+      } catch {}
+      const nurl = norm(url) || url;
 
-      if (!found.size && !pl.size) return;
+      return orig.apply(this, args).then(async (resp) => {
+        try {
+          const ct = readHeader(resp.headers, 'content-type');
+          const len = Number(readHeader(resp.headers, 'content-length')) || 0;
 
-      ensureCornerBtn();
-      ensureToast();
+          if (nurl) {
+            add(nurl, { from: 'fetch', mime: ct, size: len });
+            await sniffMaybePlaylist(nurl, ct, resp);
+          }
+        } catch {}
+        return resp;
+      });
+    };
+  }
 
-      if (msgEl) {
-        msgEl.textContent = `Media found: ${found.size} link(s) • Players: ${pl.size} (unique)`;
+  function patchXHR() {
+    const X = window.XMLHttpRequest;
+    if (!X) return;
+
+    const open0 = X.prototype.open;
+    const send0 = X.prototype.send;
+
+    X.prototype.open = function (method, url) {
+      try { this.__mf_url = norm(url) || url || ''; } catch {}
+      try { this.__mf_method = method || ''; } catch {}
+      return open0.apply(this, arguments);
+    };
+
+    X.prototype.send = function () {
+      try {
+        const onReady = () => {
+          try {
+            if (this.readyState !== 4) return;
+            const u = this.__mf_url || '';
+            if (!u) return;
+
+            let ct = '';
+            try { ct = this.getResponseHeader('content-type') || ''; } catch {}
+            let len = 0;
+            try { len = Number(this.getResponseHeader('content-length')) || 0; } catch {}
+
+            add(u, { from: 'xhr', mime: ct, size: len });
+          } catch {}
+        };
+
+        this.addEventListener('readystatechange', onReady);
+      } catch {}
+      return send0.apply(this, arguments);
+    };
+  }
+
+  function patchMediaSource() {
+    const MS = window.MediaSource;
+    if (!MS || !MS.prototype) return;
+
+    const addSB0 = MS.prototype.addSourceBuffer;
+    MS.prototype.addSourceBuffer = function (mime) {
+      try {
+        if (mime && (String(mime).includes('audio') || String(mime).includes('video') || String(mime).includes('mp4') || String(mime).includes('webm'))) {
+          add(location.href, { from: 'mediasource', mime: String(mime), note: 'MSE stream (segments)' });
+        }
+      } catch {}
+      return addSB0.apply(this, arguments);
+    };
+  }
+
+  function patchSetSrcAttr() {
+    const setAttr0 = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function (name, value) {
+      try {
+        const n = String(name || '').toLowerCase();
+        if (n === 'src' || n === 'href' || n === 'data-src' || n === 'data-href') {
+          add(value, { from: 'attr:' + n });
+        }
+      } catch {}
+      return setAttr0.apply(this, arguments);
+    };
+  }
+
+  function ensureUI() {
+    if (ui) return;
+
+    const root = document.createElement('div');
+    root.id = '__mf_root__';
+    root.attachShadow?.({ mode: 'open' });
+
+    const host = root.shadowRoot || root;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      :host, * { box-sizing: border-box; }
+      .mf_btn {
+        position: fixed; right: 12px; bottom: 12px; z-index: 2147483647;
+        background: rgba(2,6,23,.92); color: #e5e7eb;
+        border: 1px solid rgba(148,163,184,.35); border-radius: 14px;
+        padding: 10px 12px; cursor: pointer; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+        display:flex; align-items:center; gap:10px; box-shadow: 0 12px 34px rgba(0,0,0,.38);
+        backdrop-filter: blur(10px);
+      }
+      .mf_dot { width: 8px; height: 8px; border-radius: 99px; background: #38bdf8; opacity: .9; }
+      .mf_cnt { font-variant-numeric: tabular-nums; opacity: .95; }
+      .mf_toast {
+        position: fixed; left: 50%; top: 12px; transform: translateX(-50%);
+        z-index: 2147483647; pointer-events: none;
+        max-width: min(920px, calc(100vw - 24px));
+      }
+      .mf_toast > div{
+        pointer-events: auto;
+        background: rgba(2,6,23,.92); color:#e5e7eb;
+        border: 1px solid rgba(148,163,184,.35);
+        border-radius: 14px; padding: 10px 12px;
+        display:flex; gap:10px; align-items:center;
+        box-shadow: 0 12px 34px rgba(0,0,0,.38);
+        backdrop-filter: blur(10px);
+        font: 13px system-ui,-apple-system,"Segoe UI",sans-serif;
+      }
+      .mf_toast .msg { flex: 1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow: ellipsis; opacity:.95; }
+      .mf_toast button {
+        background: rgba(15,23,42,.9); color:#e5e7eb;
+        border: 1px solid rgba(148,163,184,.35); border-radius: 12px;
+        padding: 7px 10px; cursor:pointer; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+      }
+      .mf_backdrop {
+        position: fixed; inset: 0; z-index: 2147483647;
+        background: rgba(0,0,0,.45); backdrop-filter: blur(6px);
+        display:none; align-items:center; justify-content:center;
+      }
+      .mf_panel {
+        width: min(980px, calc(100vw - 24px));
+        height: min(720px, calc(100vh - 24px));
+        background: rgba(2,6,23,.96); color:#e5e7eb;
+        border: 1px solid rgba(148,163,184,.35);
+        border-radius: 18px; box-shadow: 0 22px 70px rgba(0,0,0,.55);
+        display:flex; flex-direction:column; overflow:hidden;
+      }
+      .mf_hdr {
+        padding: 12px 12px 10px 12px;
+        display:flex; gap:10px; align-items:center;
+        border-bottom: 1px solid rgba(148,163,184,.18);
+      }
+      .mf_title { font: 600 14px system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:.2px; }
+      .mf_sub { opacity:.75; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; }
+      .mf_sp { flex:1; }
+      .mf_iconbtn {
+        background: rgba(15,23,42,.9); color:#e5e7eb;
+        border: 1px solid rgba(148,163,184,.35);
+        border-radius: 12px; padding: 8px 10px; cursor:pointer;
+        font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+      }
+      .mf_row {
+        padding: 10px 12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+        border-bottom: 1px solid rgba(148,163,184,.12);
+      }
+      .mf_inp {
+        flex: 1; min-width: 220px;
+        background: rgba(15,23,42,.65); color:#e5e7eb;
+        border: 1px solid rgba(148,163,184,.25); border-radius: 14px;
+        padding: 10px 12px; outline: none; font: 12.5px system-ui,-apple-system,"Segoe UI",sans-serif;
+      }
+      .mf_sel {
+        background: rgba(15,23,42,.65); color:#e5e7eb;
+        border: 1px solid rgba(148,163,184,.25); border-radius: 14px;
+        padding: 10px 10px; outline:none; font: 12.5px system-ui,-apple-system,"Segoe UI",sans-serif;
+      }
+      .mf_body { flex:1; overflow:auto; padding: 8px 12px 12px 12px; }
+      .mf_tip { opacity:.75; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; padding: 6px 2px 10px 2px; }
+      .mf_item {
+        border: 1px solid rgba(148,163,184,.16);
+        background: rgba(15,23,42,.35);
+        border-radius: 16px;
+        padding: 10px 10px;
+        display:flex; gap:10px; align-items:flex-start;
+        margin: 10px 0;
+      }
+      .mf_badge {
+        padding: 6px 10px; border-radius: 999px;
+        border: 1px solid rgba(148,163,184,.25);
+        background: rgba(2,6,23,.55);
+        font: 600 11px system-ui,-apple-system,"Segoe UI",sans-serif;
+        opacity:.9;
+        min-width: 78px; text-align:center;
+      }
+      .mf_main { flex:1; min-width:0; }
+      .mf_url {
+        color:#7dd3fc; text-decoration:none; word-break: break-all;
+        font: 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      }
+      .mf_meta { margin-top: 6px; opacity:.72; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; }
+      .mf_actions { display:flex; gap:8px; align-items:center; }
+      .mf_actions button{
+        background: rgba(15,23,42,.85); color:#e5e7eb;
+        border: 1px solid rgba(148,163,184,.25); border-radius: 12px;
+        padding: 7px 10px; cursor:pointer; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+      }
+      .mf_compact .mf_item{ padding: 8px 10px; }
+      .mf_compact .mf_meta{ display:none; }
+    `;
+
+    const toastWrap = document.createElement('div');
+    toastWrap.className = 'mf_toast';
+    toastWrap.innerHTML = `<div><div class="msg">${t('scanning')}</div>
+      <button class="open">${t('open')}</button>
+      <button class="copy">${t('copyAll')}</button>
+      <button class="x">${t('close')}</button>
+    </div>`;
+
+    const btn = document.createElement('button');
+    btn.className = 'mf_btn';
+    btn.innerHTML = `<span class="mf_dot"></span><span class="mf_cnt">${t('title')}</span>`;
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'mf_backdrop';
+    backdrop.innerHTML = `
+      <div class="mf_panel">
+        <div class="mf_hdr">
+          <div>
+            <div class="mf_title">${t('title')}</div>
+            <div class="mf_sub" id="__mf_sub__">${t('scanning')}</div>
+          </div>
+          <div class="mf_sp"></div>
+          <button class="mf_iconbtn" id="__mf_openlist__">${t('openList')}</button>
+          <button class="mf_iconbtn" id="__mf_copyall__">${t('copyAll')}</button>
+          <button class="mf_iconbtn" id="__mf_export__">${t('export')}</button>
+          <button class="mf_iconbtn" id="__mf_close__">${t('close')}</button>
+        </div>
+        <div class="mf_row">
+          <input class="mf_inp" id="__mf_q__" placeholder="${t('search')}" />
+          <select class="mf_sel" id="__mf_filter__">
+            <option value="all">${t('filterAll')}</option>
+            <option value="audio">${t('filterAudio')}</option>
+            <option value="video">${t('filterVideo')}</option>
+            <option value="playlist">${t('filterPlaylists')}</option>
+            <option value="subs">${t('filterSubs')}</option>
+            <option value="other">${t('filterOther')}</option>
+          </select>
+          <select class="mf_sel" id="__mf_sort__">
+            <option value="newest">${t('newest')}</option>
+            <option value="oldest">${t('oldest')}</option>
+            <option value="unique">${t('uniqueFirst')}</option>
+          </select>
+          <select class="mf_sel" id="__mf_lang__">
+            <option value="auto">${t('auto')}</option>
+            <option value="en">English</option>
+            <option value="bg">Български</option>
+          </select>
+          <button class="mf_iconbtn" id="__mf_compact__">${t('compact')}</button>
+          <button class="mf_iconbtn" id="__mf_toasttoggle__">${t('toast')}: ${t('on')}</button>
+          <button class="mf_iconbtn" id="__mf_clear__">${t('clear')}</button>
+        </div>
+        <div class="mf_body" id="__mf_body__">
+          <div class="mf_tip">${t('tip')}</div>
+        </div>
+      </div>
+    `;
+
+    host.appendChild(style);
+    host.appendChild(toastWrap);
+    host.appendChild(btn);
+    host.appendChild(backdrop);
+
+    const msgEl = toastWrap.querySelector('.msg');
+    const openBtn = toastWrap.querySelector('.open');
+    const copyBtn = toastWrap.querySelector('.copy');
+    const xBtn = toastWrap.querySelector('.x');
+
+    openBtn.onclick = () => openPanel();
+    copyBtn.onclick = () => copyAll();
+    xBtn.onclick = () => { state.toast = false; renderToastState(); };
+
+    btn.onclick = () => openPanel();
+
+    backdrop.addEventListener('click', (e) => {
+      if (e.target === backdrop) closePanel();
+    });
+
+    ui = {
+      root, host, toastWrap, msgEl, btn, backdrop,
+      sub: backdrop.querySelector('#__mf_sub__'),
+      body: backdrop.querySelector('#__mf_body__'),
+      q: backdrop.querySelector('#__mf_q__'),
+      filter: backdrop.querySelector('#__mf_filter__'),
+      sort: backdrop.querySelector('#__mf_sort__'),
+      lang: backdrop.querySelector('#__mf_lang__'),
+      compact: backdrop.querySelector('#__mf_compact__'),
+      toastToggle: backdrop.querySelector('#__mf_toasttoggle__'),
+      clear: backdrop.querySelector('#__mf_clear__'),
+      copyAllBtn: backdrop.querySelector('#__mf_copyall__'),
+      exportBtn: backdrop.querySelector('#__mf_export__'),
+      openListBtn: backdrop.querySelector('#__mf_openlist__'),
+      closeBtn: backdrop.querySelector('#__mf_close__')
+    };
+
+    ui.q.addEventListener('input', () => { state.query = ui.q.value || ''; renderList(); });
+    ui.filter.addEventListener('change', () => { state.filter = ui.filter.value; renderList(); });
+    ui.sort.addEventListener('change', () => { state.sort = ui.sort.value; renderList(); });
+    ui.lang.addEventListener('change', () => { state.lang = ui.lang.value; rerenderAllText(); });
+    ui.compact.onclick = () => { state.compact = !state.compact; renderList(); };
+    ui.toastToggle.onclick = () => { state.toast = !state.toast; renderToastState(); };
+    ui.clear.onclick = () => { found.clear(); srcSeen.clear(); renderAll(); };
+    ui.copyAllBtn.onclick = () => copyAll();
+    ui.exportBtn.onclick = () => exportTxt();
+    ui.openListBtn.onclick = () => openList();
+    ui.closeBtn.onclick = () => closePanel();
+
+    const mount = () => {
+      if (!document.documentElement) return;
+      document.documentElement.appendChild(root);
+      renderAll();
+    };
+
+    if (document.documentElement) mount();
+    else document.addEventListener('DOMContentLoaded', mount, { once: true });
+  }
+
+  function renderToastState() {
+    ensureUI();
+    ui.toastWrap.style.display = state.toast ? '' : 'none';
+    ui.toastToggle.textContent = `${t('toast')}: ${state.toast ? t('on') : t('off')}`;
+  }
+
+  function openPanel() {
+    ensureUI();
+    uiOpen = true;
+    ui.backdrop.style.display = 'flex';
+    renderAll();
+  }
+
+  function closePanel() {
+    if (!ui) return;
+    uiOpen = false;
+    ui.backdrop.style.display = 'none';
+  }
+
+  function rerenderAllText() {
+    if (!ui) return;
+
+    ui.toastWrap.querySelector('.open').textContent = t('open');
+    ui.toastWrap.querySelector('.copy').textContent = t('copyAll');
+    ui.toastWrap.querySelector('.x').textContent = t('close');
+
+    ui.openListBtn.textContent = t('openList');
+    ui.copyAllBtn.textContent = t('copyAll');
+    ui.exportBtn.textContent = t('export');
+    ui.closeBtn.textContent = t('close');
+
+    ui.q.placeholder = t('search');
+
+    ui.filter.querySelector('option[value="all"]').textContent = t('filterAll');
+    ui.filter.querySelector('option[value="audio"]').textContent = t('filterAudio');
+    ui.filter.querySelector('option[value="video"]').textContent = t('filterVideo');
+    ui.filter.querySelector('option[value="playlist"]').textContent = t('filterPlaylists');
+    ui.filter.querySelector('option[value="subs"]').textContent = t('filterSubs');
+    ui.filter.querySelector('option[value="other"]').textContent = t('filterOther');
+
+    ui.sort.querySelector('option[value="newest"]').textContent = t('newest');
+    ui.sort.querySelector('option[value="oldest"]').textContent = t('oldest');
+    ui.sort.querySelector('option[value="unique"]').textContent = t('uniqueFirst');
+
+    ui.lang.querySelector('option[value="auto"]').textContent = t('auto');
+
+    ui.compact.textContent = t('compact');
+    ui.clear.textContent = t('clear');
+
+    renderToastState();
+    renderAll();
+  }
+
+  function formatBytes(n) {
+    n = Number(n) || 0;
+    if (!n) return '';
+    const u = ['B','KB','MB','GB','TB'];
+    let i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? String(Math.round(n)) : String(Math.round(n * 10) / 10)) + ' ' + u[i];
+  }
+
+  function clip(s, n) {
+    s = String(s || '');
+    if (s.length <= n) return s;
+    return s.slice(0, n - 1) + '…';
+  }
+
+  function listItems() {
+    const q = String(state.query || '').toLowerCase().trim();
+
+    const items = [];
+    for (const [url, meta] of found) {
+      const type = guessType(url, meta.mime);
+      if (state.filter !== 'all' && type !== state.filter) continue;
+
+      if (q) {
+        const hay = (url + ' ' + (meta.mime || '') + ' ' + (meta.note || '') + ' ' + Array.from(meta.from || []).join(' ')).toLowerCase();
+        if (!hay.includes(q)) continue;
       }
 
-      listUrl = null;
-    }, 300);
-  }
-
-  function buildListUrl() {
-    const urls = Array.from(found);
-
-    const uniqSrc = [];
-    for (const [, info] of pl) {
-      if (info?.src && extRe.test(info.src)) uniqSrc.push(info.src);
+      items.push({ url, meta, type });
     }
 
-    const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
-
-    const playerItems = uniqSrc.slice(0, 80).map(u => {
-      const e = esc(u);
-      return `<li><a href="${e}" target="_blank" rel="noreferrer noopener">${e}</a></li>`;
-    }).join('');
-
-    const urlItems = urls.map(u => {
-      const e = esc(u);
-      return `<li><a href="${e}" target="_blank" rel="noreferrer noopener">${e}</a></li>`;
-    }).join('');
-
-    const html =
-`<!doctype html><html><head><meta charset="utf-8">
-<title>Media Finder Results</title>
-<style>
-body{background:#020617;color:#e5e7eb;font:13px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:12px;}
-a{color:#38bdf8;word-break:break-all;}
-code{color:#e5e7eb;background:#111827;padding:2px 4px;border-radius:4px;}
-h1{font-size:18px;margin:0 0 10px 0;}
-h2{font-size:14px;margin:14px 0 8px 0;}
-</style></head><body>
-<h1>Found ${urls.length} media URL${urls.length === 1 ? '' : 's'}</h1>
-<p>Zoom commonly uses <code>.m3u8</code> (HLS) or <code>.mpd</code> (DASH).</p>
-<h2>Unique player sources (${uniqSrc.length})</h2>
-<ul>${playerItems || '<li>(none)</li>'}</ul>
-<h2>All captured URLs (${urls.length})</h2>
-<ul>${urlItems || '<li>(none)</li>'}</ul>
-</body></html>`;
-
-    try {
-      const blob = new Blob([html], { type: 'text/html' });
-      return URL.createObjectURL(blob);
-    } catch {
-      return 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
+    if (state.sort === 'newest') items.sort((a,b) => (b.meta.ts || 0) - (a.meta.ts || 0));
+    else if (state.sort === 'oldest') items.sort((a,b) => (a.meta.ts || 0) - (b.meta.ts || 0));
+    else if (state.sort === 'unique') {
+      items.sort((a,b) => {
+        const af = (a.meta.from && a.meta.from.size) || 0;
+        const bf = (b.meta.from && b.meta.from.size) || 0;
+        if (bf !== af) return bf - af;
+        return (b.meta.ts || 0) - (a.meta.ts || 0);
+      });
     }
+
+    return items;
   }
 
-  function openList() {
-    if (!found.size) {
-      ensureToast();
-      if (msgEl) msgEl.textContent = 'Media Finder: no links yet (press play and wait a second).';
+  function renderList() {
+    ensureUI();
+    const items = listItems();
+
+    ui.body.classList.toggle('mf_compact', !!state.compact);
+
+    const tip = `<div class="mf_tip">${t('tip')}</div>`;
+    if (!items.length) {
+      ui.body.innerHTML = tip + `<div class="mf_item"><div class="mf_badge">${t('found')}</div><div class="mf_main">
+        <div class="mf_meta">${t('noneYet')}</div>
+      </div></div>`;
       return;
     }
-    if (!listUrl) listUrl = buildListUrl();
 
-    if (typeof GM_openInTab === 'function') {
-      GM_openInTab(listUrl, { active: false, insert: true, setParent: true });
-    } else {
-      window.open(listUrl, '_blank', 'noopener,noreferrer');
+    const html = [tip];
+
+    for (const it of items.slice(0, CFG.maxItems)) {
+      const meta = it.meta || {};
+      const badge =
+        it.type === 'audio' ? t('filterAudio') :
+        it.type === 'video' ? t('filterVideo') :
+        it.type === 'playlist' ? t('filterPlaylists') :
+        it.type === 'subs' ? t('filterSubs') : t('filterOther');
+
+      const mime = meta.mime ? clip(meta.mime, 70) : '';
+      const size = meta.size ? formatBytes(meta.size) : '';
+      const from = meta.from && meta.from.size ? Array.from(meta.from).join(', ') : '';
+      const note = meta.note ? meta.note : '';
+
+      html.push(`
+        <div class="mf_item">
+          <div class="mf_badge">${badge}</div>
+          <div class="mf_main">
+            <a class="mf_url" href="${escapeAttr(it.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(it.url)}</a>
+            <div class="mf_meta">
+              ${mime ? `<span>${escapeHtml(mime)}</span>` : ''}
+              ${size ? `<span> • ${escapeHtml(size)}</span>` : ''}
+              ${note ? `<span> • ${escapeHtml(note)}</span>` : ''}
+              ${from ? `<div style="margin-top:6px;opacity:.75;">${escapeHtml(from)}</div>` : ''}
+            </div>
+          </div>
+          <div class="mf_actions">
+            <button data-act="copy" data-url="${escapeAttr(it.url)}">${t('copy')}</button>
+            <button data-act="open" data-url="${escapeAttr(it.url)}">${t('open')}</button>
+          </div>
+        </div>
+      `);
+    }
+
+    ui.body.innerHTML = html.join('');
+
+    ui.body.querySelectorAll('button[data-act]').forEach(b => {
+      b.onclick = () => {
+        const act = b.getAttribute('data-act');
+        const url = b.getAttribute('data-url') || '';
+        if (!url) return;
+        if (act === 'open') openUrl(url);
+        else if (act === 'copy') copyOne(url);
+      };
+    });
+  }
+
+  function renderHeader() {
+    ensureUI();
+
+    const cnt = found.size;
+    const pCnt = players.size;
+
+    const sub = `${t('found')}: ${cnt} ${t('links')} • ${t('players')}: ${pCnt}`;
+    ui.sub.textContent = sub;
+
+    ui.btn.querySelector('.mf_cnt').textContent = `${t('title')} • ${cnt}`;
+    if (ui.msgEl) ui.msgEl.textContent = sub;
+
+    ui.filter.value = state.filter;
+    ui.sort.value = state.sort;
+    ui.lang.value = state.lang;
+    ui.q.value = state.query || '';
+    renderToastState();
+  }
+
+  function renderAll() {
+    renderHeader();
+    renderList();
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+  function escapeAttr(s) {
+    return escapeHtml(s).replace(/`/g,'&#96;');
+  }
+
+  function maybeToast() {
+    if (!state.toast) return;
+    const n = now();
+    if (n - lastToast < 250) return;
+    lastToast = n;
+
+    ensureUI();
+    ui.toastWrap.style.display = state.toast ? '' : 'none';
+
+    if (CFG.toastAutoHideMs > 0) {
+      ui.toastWrap.style.opacity = '1';
+      setTimeout(() => { try { ui.toastWrap.style.opacity = '0'; } catch {} }, CFG.toastAutoHideMs);
+    }
+  }
+
+  async function copyOne(url) {
+    try {
+      await navigator.clipboard.writeText(url);
+      if (ui?.msgEl) ui.msgEl.textContent = `${t('copied')} 1 ${t('items')}`;
+    } catch {
+      if (ui?.msgEl) ui.msgEl.textContent = t('clipboardBlocked');
     }
   }
 
   async function copyAll() {
-    const txt = Array.from(found).join('\n');
+    const txt = Array.from(found.keys()).join('\n');
     try {
       await navigator.clipboard.writeText(txt);
-      ensureToast();
-      if (msgEl) msgEl.textContent = `Copied ${found.size} link(s)`;
+      ensureUI();
+      if (ui.msgEl) ui.msgEl.textContent = `${t('copied')} ${found.size} ${t('items')}`;
     } catch {
-      ensureToast();
-      if (msgEl) msgEl.textContent = 'Clipboard blocked — use Open list';
+      ensureUI();
+      if (ui.msgEl) ui.msgEl.textContent = t('clipboardBlocked');
     }
+  }
+
+  function openUrl(url) {
+    try {
+      if (typeof GM_openInTab === 'function') GM_openInTab(url, { active: true, insert: true, setParent: true });
+      else window.open(url, '_blank', 'noopener,noreferrer');
+    } catch {}
+  }
+
+  function buildListHtml() {
+    const items = listItems();
+    const rows = items.map(it => {
+      const meta = it.meta || {};
+      const type = guessType(it.url, meta.mime);
+      const badge =
+        type === 'audio' ? t('filterAudio') :
+        type === 'video' ? t('filterVideo') :
+        type === 'playlist' ? t('filterPlaylists') :
+        type === 'subs' ? t('filterSubs') : t('filterOther');
+
+      const from = meta.from && meta.from.size ? Array.from(meta.from).join(', ') : '';
+      const mime = meta.mime || '';
+      const size = meta.size ? formatBytes(meta.size) : '';
+      const note = meta.note || '';
+
+      return `<tr>
+        <td><span class="b">${escapeHtml(badge)}</span></td>
+        <td><a href="${escapeAttr(it.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(it.url)}</a></td>
+        <td>${escapeHtml(mime)}</td>
+        <td>${escapeHtml(size)}</td>
+        <td>${escapeHtml(note)}</td>
+        <td>${escapeHtml(from)}</td>
+      </tr>`;
+    }).join('');
+
+    return `<!doctype html><html><head><meta charset="utf-8">
+      <title>${escapeHtml(t('title'))}</title>
+      <style>
+        body{background:#020617;color:#e5e7eb;font:13px system-ui,-apple-system,"Segoe UI",sans-serif;padding:12px;}
+        a{color:#7dd3fc;word-break:break-all;text-decoration:none;}
+        table{width:100%;border-collapse:collapse;margin-top:10px;}
+        th,td{border:1px solid rgba(148,163,184,.22);padding:8px;vertical-align:top;}
+        th{background:#0b1220;text-align:left;}
+        .b{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid rgba(148,163,184,.3);background:#0b1220;font-weight:600;font-size:12px;}
+        .tip{opacity:.75;margin-top:6px;}
+      </style>
+    </head><body>
+      <h1 style="margin:0 0 6px 0;font-size:18px;">${escapeHtml(t('title'))}</h1>
+      <div class="tip">${escapeHtml(t('tip'))}</div>
+      <div style="opacity:.8;margin-top:8px;">${escapeHtml(t('found'))}: ${found.size} • ${escapeHtml(t('players'))}: ${players.size}</div>
+      <table>
+        <thead><tr>
+          <th>Type</th><th>URL</th><th>MIME</th><th>Size</th><th>Note</th><th>From</th>
+        </tr></thead>
+        <tbody>${rows || `<tr><td colspan="6">${escapeHtml(t('noneYet'))}</td></tr>`}</tbody>
+      </table>
+    </body></html>`;
+  }
+
+  function openList() {
+    ensureUI();
+    if (!found.size) {
+      if (ui.msgEl) ui.msgEl.textContent = t('noneYet');
+      return;
+    }
+
+    const html = buildListHtml();
+    let url = '';
+    try {
+      const blob = new Blob([html], { type: 'text/html' });
+      url = URL.createObjectURL(blob);
+    } catch {
+      url = 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
+    }
+
+    openUrl(url);
+  }
+
+  function exportTxt() {
+    if (!found.size) return;
+
+    const txt = Array.from(found.keys()).join('\n');
+    const name = 'media_finder_' + new Date().toISOString().replace(/[:.]/g,'-') + '.txt';
+    try {
+      const blob = new Blob([txt], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.rel = 'noreferrer noopener';
+      a.click();
+      setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 2000);
+    } catch {}
+  }
+
+  let renderT = null;
+  function scheduleRender() {
+    if (renderT) return;
+    renderT = setTimeout(() => {
+      renderT = null;
+      if (!ui) ensureUI();
+      cleanupPlayers();
+      renderAll();
+    }, 220);
   }
 
   function watchPlayers() {
@@ -297,6 +1020,8 @@ h2{font-size:14px;margin:14px 0 8px 0;}
     };
     document.addEventListener('play', h, true);
     document.addEventListener('loadedmetadata', h, true);
+    document.addEventListener('emptied', h, true);
+    document.addEventListener('durationchange', h, true);
 
     let moT = null;
     const mo = new MutationObserver(() => {
@@ -308,17 +1033,29 @@ h2{font-size:14px;margin:14px 0 8px 0;}
       }, 250);
     });
 
-    try { mo.observe(document.documentElement || document, { childList: true, subtree: true }); } catch {}
+    try { mo.observe(document.documentElement || document, { childList: true, subtree: true, attributes: true, attributeFilter: ['src','href','data-src','data-href'] }); } catch {}
   }
 
   function start() {
+    patchFetch();
+    patchXHR();
+    patchMediaSource();
+    patchSetSrcAttr();
+
     observeResources();
     watchPlayers();
     scanDom();
-    setInterval(cleanupPlayers, 3000);
-    setTimeout(scanDom, 1200);
+
+    setInterval(() => {
+      cleanupPlayers();
+      scanDom();
+      scheduleRender();
+    }, CFG.scanIntervalMs);
+
+    ensureUI();
+    renderAll();
   }
 
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
   else start();
 })();
