@@ -1,12 +1,15 @@
 // ==UserScript==
-// @name         Media Finder (advanced + clean UI + auto language)
+// @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
-// @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing and better preview UX
+// @version      1.3.0
+// @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing, extractor-page detection, and richer download UX
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_openInTab
 // @grant        GM_download
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
 // @downloadURL  https://github.com/ltseverydayyou/userscripts/raw/main/media%20finder.user.js
 // @updateURL    https://github.com/ltseverydayyou/userscripts/raw/main/media%20finder.meta.js
 // ==/UserScript==
@@ -27,7 +30,10 @@
     toastAutoHideMs: 0,
     allowDataUrls: false,
     allowBlobUrls: true,
-    includeQueryExt: true
+    includeQueryExt: true,
+    bridgeUrl: 'http://127.0.0.1:38491',
+    bridgeTimeoutMs: 30000,
+    bridgeRetryMs: 30000
   };
 
   const EXT = [
@@ -56,6 +62,23 @@
     /^text\/(plain|vtt)/i
   ];
 
+  const EXTRACTOR_RULES = [
+    { id: 'youtube', label: 'YouTube', hosts: ['youtube.com', 'youtu.be'] },
+    { id: 'instagram', label: 'Instagram', hosts: ['instagram.com'] },
+    { id: 'facebook', label: 'Facebook', hosts: ['facebook.com', 'fb.watch'] },
+    { id: 'tiktok', label: 'TikTok', hosts: ['tiktok.com'] },
+    { id: 'twitter', label: 'X', hosts: ['x.com', 'twitter.com'] },
+    { id: 'reddit', label: 'Reddit', hosts: ['reddit.com', 'redd.it', 'v.redd.it'] },
+    { id: 'vimeo', label: 'Vimeo', hosts: ['vimeo.com', 'player.vimeo.com'] },
+    { id: 'dailymotion', label: 'Dailymotion', hosts: ['dailymotion.com', 'dai.ly'] },
+    { id: 'twitch', label: 'Twitch', hosts: ['twitch.tv', 'clips.twitch.tv'] },
+    { id: 'soundcloud', label: 'SoundCloud', hosts: ['soundcloud.com'] },
+    { id: 'bandcamp', label: 'Bandcamp', hosts: ['bandcamp.com'] },
+    { id: 'bilibili', label: 'Bilibili', hosts: ['bilibili.com', 'b23.tv'] }
+  ];
+  const EXTRACTOR_PATH_RE = /\/(?:watch|shorts|live|embed|reel|reels|video|videos|clip|clips|status|stories|story|post|posts|p\/|tv\/|playlist|album|track|sets|episode|show|stream|broadcast|music|channel|v\/|media)\b/i;
+  const EXTRACTOR_QUERY_RE = /(?:^|[?&])(v|list|clip|video_id|story_fbid|fbid|media_id)=/i;
+
   const extRe = new RegExp('(\\.|%2E)(' + EXT.join('|') + ')(?=($|[?#&/]))', 'i');
   const scriptUrlCandidateRe = new RegExp('\\.(?:' + EXT.join('|') + ')(?:\\b|[?#])', 'i');
   const qExtRe = /[?&#](?:file|filename|name|url|src|media|video|audio|image|img|poster|thumb|thumbnail|download|path)=([^&#]+)/i;
@@ -79,6 +102,10 @@
   let hooksInstalled = false;
   let runtimeStarted = false;
   let ytSnapshotSig = '';
+  let bridgeAvailable = null;
+  let bridgeLastErrorAt = 0;
+  const bridgeProbeSeen = new Set();
+  const bridgeProbeInflight = new Set();
 
   const LANGS = {
     en: {
@@ -100,6 +127,7 @@
       filterAudio: 'Audio',
       filterVideo: 'Video',
       filterPlaylists: 'Playlists',
+      filterExtractors: 'Pages',
       filterSubs: 'Subs',
       filterOther: 'Other',
       settings: 'Settings',
@@ -127,7 +155,21 @@
       selectPreview: 'Select an item to preview on the right.',
       launcherHide: 'Hide toggle button',
       launcherShow: 'Show toggle button',
-      layout: 'Layout'
+      layout: 'Layout',
+      ytDlpOptions: 'yt-dlp',
+      ytDlpModeVideo: 'Video cmd',
+      ytDlpModeAudio: 'Audio cmd',
+      ytDlpModeExtract: 'MP3 cmd',
+      ytDlpSubs: 'Subs',
+      ytDlpThumbs: 'Thumbs',
+      ytDlpCustomArgs: 'yt-dlp args...',
+      copyCommand: 'Copy cmd',
+      commandCopied: 'Command copied',
+      extractorPage: 'Extractor page',
+      openPage: 'Open page',
+      probe: 'Probe',
+      probing: 'Probing',
+      bridgeDown: 'Bridge offline'
     },
     bg: {
       title: 'Търсач на медия',
@@ -172,7 +214,21 @@
       selectPreview: 'Select an item to preview on the right.',
       launcherHide: 'Hide toggle button',
       launcherShow: 'Show toggle button',
-      layout: 'Layout'
+      layout: 'Layout',
+      ytDlpOptions: 'yt-dlp',
+      ytDlpModeVideo: 'Video cmd',
+      ytDlpModeAudio: 'Audio cmd',
+      ytDlpModeExtract: 'MP3 cmd',
+      ytDlpSubs: 'Subs',
+      ytDlpThumbs: 'Thumbs',
+      ytDlpCustomArgs: 'yt-dlp args...',
+      copyCommand: 'Copy cmd',
+      commandCopied: 'Command copied',
+      extractorPage: 'Extractor page',
+      openPage: 'Open page',
+      probe: 'Probe',
+      probing: 'Probing',
+      bridgeDown: 'Bridge offline'
     }
   };
 
@@ -184,6 +240,11 @@
     compact: false,
     toast: false,
     layout: 'list',
+    ytDlpVisible: false,
+    ytDlpMode: 'video',
+    ytDlpSubs: false,
+    ytDlpThumbs: false,
+    ytDlpCustomArgs: '',
     launcherVisible: true,
     previewUrl: '',
     previewType: ''
@@ -202,9 +263,10 @@
   function applySavedState(saved) {
     if (!saved || typeof saved !== 'object') return;
     const okLang = new Set(['auto', 'en', 'bg']);
-    const okFilter = new Set(['all', 'image', 'audio', 'video', 'playlist', 'subs', 'other']);
+    const okFilter = new Set(['all', 'image', 'audio', 'video', 'playlist', 'extractor', 'subs', 'other']);
     const okSort = new Set(['newest', 'oldest', 'unique']);
     const okLayout = new Set(['list', 'grid']);
+    const okYtMode = new Set(['video', 'audio', 'extract']);
 
     if (okLang.has(saved.lang)) state.lang = saved.lang;
     if (okFilter.has(saved.filter)) state.filter = saved.filter;
@@ -213,6 +275,11 @@
     if (typeof saved.compact === 'boolean') state.compact = saved.compact;
     if (typeof saved.toast === 'boolean') state.toast = saved.toast;
     if (okLayout.has(saved.layout)) state.layout = saved.layout;
+    if (typeof saved.ytDlpVisible === 'boolean') state.ytDlpVisible = saved.ytDlpVisible;
+    if (okYtMode.has(saved.ytDlpMode)) state.ytDlpMode = saved.ytDlpMode;
+    if (typeof saved.ytDlpSubs === 'boolean') state.ytDlpSubs = saved.ytDlpSubs;
+    if (typeof saved.ytDlpThumbs === 'boolean') state.ytDlpThumbs = saved.ytDlpThumbs;
+    if (typeof saved.ytDlpCustomArgs === 'string') state.ytDlpCustomArgs = saved.ytDlpCustomArgs;
     if (typeof saved.launcherVisible === 'boolean') state.launcherVisible = saved.launcherVisible;
   }
 
@@ -226,6 +293,11 @@
         compact: !!state.compact,
         toast: !!state.toast,
         layout: state.layout,
+        ytDlpVisible: !!state.ytDlpVisible,
+        ytDlpMode: state.ytDlpMode,
+        ytDlpSubs: !!state.ytDlpSubs,
+        ytDlpThumbs: !!state.ytDlpThumbs,
+        ytDlpCustomArgs: state.ytDlpCustomArgs || '',
         launcherVisible: !!state.launcherVisible
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -300,6 +372,7 @@
     if (s === 'audio') return 'audio';
     if (s === 'video') return 'video';
     if (s === 'playlist' || s === 'm3u8' || s === 'mpd') return 'playlist';
+    if (s === 'extractor' || s === 'page' || s === 'site') return 'extractor';
     if (s === 'subs' || s === 'subtitle' || s === 'subtitles' || s === 'track') return 'subs';
     return '';
   }
@@ -410,6 +483,251 @@
     return h === 'youtube.com' || h.endsWith('.youtube.com') || h === 'youtu.be' || h.endsWith('.youtu.be');
   }
 
+  function hostMatches(host, ruleHost) {
+    const h = String(host || '').toLowerCase();
+    const r = String(ruleHost || '').toLowerCase();
+    return h === r || h.endsWith('.' + r);
+  }
+
+  function getExtractorRule(raw) {
+    try {
+      const u = new URL(raw, location.href);
+      const host = String(u.hostname || '').toLowerCase();
+      return EXTRACTOR_RULES.find(rule => rule.hosts.some(ruleHost => hostMatches(host, ruleHost))) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function pageLooksExtractable(raw) {
+    try {
+      const u = new URL(raw, location.href);
+      const path = String(u.pathname || '');
+      return EXTRACTOR_PATH_RE.test(path) || EXTRACTOR_QUERY_RE.test(u.search || '');
+    } catch {
+      return false;
+    }
+  }
+
+  function hasLikelyContentPath(raw) {
+    try {
+      const u = new URL(raw, location.href);
+      const segs = String(u.pathname || '').split('/').filter(Boolean);
+      if (!segs.length) return false;
+      const joined = segs.join('/').toLowerCase();
+      if (/^(home|feed|explore|search|discover|login|signup|about|privacy|terms|settings|download)s?$/.test(joined)) return false;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function hasExtractorDomHints() {
+    try {
+      return !!document.querySelector(
+        'meta[property="og:video"],meta[property="og:video:url"],meta[name="twitter:player"],meta[itemprop="contentUrl"],meta[itemprop="embedUrl"],video,audio'
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function addExtractorCandidate(raw, from, label) {
+    const u = norm(raw);
+    if (!u || looksLikeMedia(u)) return;
+    const rule = getExtractorRule(u);
+    if (!rule) return;
+    const hinted = pageLooksExtractable(u) || hasExtractorDomHints() || hasLikelyContentPath(u) || isYouTubeHost();
+    if (!hinted) return;
+    add(u, {
+      from: from || ('page:' + rule.id),
+      hintType: 'extractor',
+      note: `${label || rule.label} ${t('extractorPage')}`
+    });
+  }
+
+  function gmRequest(details) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('GM_xmlhttpRequest unavailable'));
+        return;
+      }
+      GM_xmlhttpRequest({
+        ...details,
+        onload: (resp) => resolve(resp),
+        onerror: (err) => reject(new Error(err?.error || 'request_failed')),
+        ontimeout: () => reject(new Error('request_timeout'))
+      });
+    });
+  }
+
+  async function bridgeRequest(path, payload) {
+    const resp = await gmRequest({
+      method: 'POST',
+      url: CFG.bridgeUrl + path,
+      headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify(payload || {}),
+      timeout: CFG.bridgeTimeoutMs
+    });
+    const parsed = safeJsonParse(resp?.responseText || '{}');
+    if (!resp || resp.status < 200 || resp.status >= 300 || !parsed || parsed.ok === false) {
+      throw new Error(parsed?.error || `bridge_http_${resp?.status || 0}`);
+    }
+    bridgeAvailable = true;
+    return parsed;
+  }
+
+  function ytTypeFromFormat(fmt) {
+    if (!fmt || typeof fmt !== 'object') return '';
+    const protocol = String(fmt.protocol || '').toLowerCase();
+    const ext = String(fmt.ext || '').toLowerCase();
+    if (protocol.includes('m3u8') || protocol.includes('dash') || protocol.includes('mhtml') || ext === 'm3u8' || ext === 'mpd') return 'playlist';
+    const hasVideo = fmt.vcodec && fmt.vcodec !== 'none';
+    const hasAudio = fmt.acodec && fmt.acodec !== 'none';
+    if (hasVideo) return 'video';
+    if (hasAudio) return 'audio';
+    if (SUB_EXT.has(ext)) return 'subs';
+    if (IMAGE_EXT.has(ext)) return 'image';
+    return '';
+  }
+
+  function makeYtNote(extractor, parts) {
+    const out = ['yt-dlp'];
+    if (extractor) out.push(extractor);
+    for (const part of parts || []) {
+      const x = String(part || '').trim();
+      if (x) out.push(x);
+    }
+    return out.join(' | ');
+  }
+
+  function ingestSubtitleTracks(trackMap, extractor, flavor) {
+    if (!trackMap || typeof trackMap !== 'object') return;
+    for (const [lang, tracks] of Object.entries(trackMap)) {
+      if (!Array.isArray(tracks)) continue;
+      for (const tr of tracks) {
+        if (!tr?.url) continue;
+        const note = makeYtNote(extractor, [flavor, lang, tr.ext || tr.name || '']);
+        add(tr.url, {
+          from: 'yt-dlp:subs',
+          mime: tr.ext === 'vtt' ? 'text/vtt' : '',
+          note,
+          hintType: 'subs'
+        });
+      }
+    }
+  }
+
+  function ingestYtDlpMetadata(metadata, sourceUrl) {
+    if (!metadata || typeof metadata !== 'object') return;
+    const extractor = String(metadata.extractor_key || metadata.extractor || '').trim();
+    const pageUrl = norm(metadata.webpage_url || sourceUrl || '') || '';
+
+    if (pageUrl) {
+      add(pageUrl, {
+        from: 'yt-dlp:page',
+        hintType: 'extractor',
+        note: makeYtNote(extractor, [t('extractorPage')])
+      });
+    }
+
+    if (metadata.url) {
+      add(metadata.url, {
+        from: 'yt-dlp:root',
+        note: makeYtNote(extractor, [metadata.format_id || '', metadata.ext || '']),
+        hintType: ytTypeFromFormat(metadata)
+      });
+    }
+    if (metadata.manifest_url) {
+      add(metadata.manifest_url, {
+        from: 'yt-dlp:manifest',
+        note: makeYtNote(extractor, ['manifest']),
+        hintType: 'playlist'
+      });
+    }
+    if (metadata.hls_aes?.uri) {
+      add(metadata.hls_aes.uri, {
+        from: 'yt-dlp:key',
+        note: makeYtNote(extractor, ['hls-key']),
+        hintType: 'other'
+      });
+    }
+
+    const formats = Array.isArray(metadata.formats) ? metadata.formats : [];
+    for (const fmt of formats) {
+      if (!fmt || typeof fmt !== 'object') continue;
+      const type = ytTypeFromFormat(fmt);
+      const fmtUrl = norm(fmt.url || '') || '';
+      const manifestUrl = norm(fmt.manifest_url || '') || '';
+      const size = Number(fmt.filesize) || Number(fmt.filesize_approx) || 0;
+      const note = makeYtNote(extractor, [
+        fmt.format_id || '',
+        fmt.format_note || '',
+        fmt.ext || '',
+        fmt.height ? `${fmt.height}p` : ''
+      ]);
+
+      if (fmtUrl) {
+        add(fmtUrl, {
+          from: 'yt-dlp:format',
+          size,
+          note,
+          hintType: type || ''
+        });
+      }
+      if (manifestUrl && manifestUrl !== fmtUrl) {
+        add(manifestUrl, {
+          from: 'yt-dlp:manifest',
+          size,
+          note,
+          hintType: 'playlist'
+        });
+      }
+    }
+
+    ingestSubtitleTracks(metadata.subtitles, extractor, 'subs');
+    ingestSubtitleTracks(metadata.automatic_captions, extractor, 'auto-subs');
+
+    const thumbs = Array.isArray(metadata.thumbnails) ? metadata.thumbnails : [];
+    for (const th of thumbs) {
+      if (!th?.url) continue;
+      add(th.url, {
+        from: 'yt-dlp:thumbnail',
+        note: makeYtNote(extractor, ['thumbnail', th.id || '', th.ext || '']),
+        hintType: 'image'
+      });
+    }
+
+    scheduleRender();
+  }
+
+  async function probeBridgeForUrl(raw, force) {
+    const u = norm(raw);
+    if (!u || !getExtractorRule(u)) return;
+    if (bridgeProbeInflight.has(u)) return;
+    if (!force && bridgeProbeSeen.has(u)) return;
+    if (!force && bridgeAvailable === false && now() - bridgeLastErrorAt < CFG.bridgeRetryMs) return;
+
+    bridgeProbeInflight.add(u);
+    try {
+      if (ui?.msgEl && force) ui.msgEl.textContent = `${t('probing')} ${clip(u, 96)}`;
+      const payload = await bridgeRequest('/extract', {
+        url: u,
+        noPlaylist: true,
+        extraArgs: state.ytDlpCustomArgs || ''
+      });
+      bridgeProbeSeen.add(u);
+      ingestYtDlpMetadata(payload?.metadata || null, u);
+      if (ui?.msgEl && force) ui.msgEl.textContent = `${t('found')}: ${found.size} ${t('links')}`;
+    } catch (error) {
+      bridgeAvailable = false;
+      bridgeLastErrorAt = now();
+      if (ui?.msgEl && force) ui.msgEl.textContent = `${t('bridgeDown')}: ${error.message}`;
+    } finally {
+      bridgeProbeInflight.delete(u);
+    }
+  }
+
   function guessType(u, mime, hint) {
     const lower = String(u || '').toLowerCase();
     let ct = String(mime || '').toLowerCase();
@@ -426,6 +744,7 @@
     if (ct.includes('mp2t')) return 'video';
 
     if (ct.includes('vtt') || lower.includes('.vtt') || lower.includes('.srt')) return 'subs';
+    if (h === 'extractor') return 'extractor';
 
     if (ct.startsWith('image/')) return 'image';
     if (ct.startsWith('audio/')) return 'audio';
@@ -642,11 +961,33 @@
     } catch { }
   }
 
+  function scanExtractorPages() {
+    addExtractorCandidate(location.href, 'page:location');
+    probeBridgeForUrl(location.href, false);
+
+    try {
+      const canonical = document.querySelector('link[rel="canonical"]')?.getAttribute('href') || '';
+      if (canonical) {
+        addExtractorCandidate(canonical, 'page:canonical');
+        probeBridgeForUrl(canonical, false);
+      }
+    } catch { }
+
+    try {
+      const og = document.querySelector('meta[property="og:url"],meta[name="og:url"]')?.getAttribute('content') || '';
+      if (og) {
+        addExtractorCandidate(og, 'page:og-url');
+        probeBridgeForUrl(og, false);
+      }
+    } catch { }
+  }
+
   function runDeepExtractors() {
     scanMetaTags();
     scanJsonLd();
     scanInlineScriptsForMediaUrls();
     extractYouTubeMedia();
+    scanExtractorPages();
   }
 
   function getMediaSrc(el) {
@@ -1199,6 +1540,7 @@
             <option value="audio">${t('filterAudio')}</option>
             <option value="video">${t('filterVideo')}</option>
             <option value="playlist">${t('filterPlaylists')}</option>
+            <option value="extractor">${t('filterExtractors')}</option>
             <option value="subs">${t('filterSubs')}</option>
             <option value="other">${t('filterOther')}</option>
           </select>
@@ -1298,7 +1640,7 @@
     ui.compact.onclick = () => { state.compact = !state.compact; saveState(); renderList(); };
     ui.layout.onclick = () => { state.layout = state.layout === 'list' ? 'grid' : 'list'; saveState(); renderList(); renderHeader(); };
     ui.toastToggle.onclick = () => { state.toast = !state.toast; saveState(); renderToastState(); };
-    ui.clear.onclick = () => { found.clear(); srcSeen.clear(); tsSeen.clear(); ytSnapshotSig = ''; state.previewUrl = ''; state.previewType = ''; previewState = { url: '', sig: '' }; renderAll(); };
+    ui.clear.onclick = () => { found.clear(); srcSeen.clear(); tsSeen.clear(); bridgeProbeSeen.clear(); ytSnapshotSig = ''; state.previewUrl = ''; state.previewType = ''; previewState = { url: '', sig: '' }; renderAll(); scanExtractorPages(); };
     ui.copyAllBtn.onclick = () => copyAll();
     ui.exportBtn.onclick = () => exportTxt();
     ui.openListBtn.onclick = () => openList();
@@ -1383,6 +1725,7 @@
     ui.filter.querySelector('option[value="audio"]').textContent = t('filterAudio');
     ui.filter.querySelector('option[value="video"]').textContent = t('filterVideo');
     ui.filter.querySelector('option[value="playlist"]').textContent = t('filterPlaylists');
+    ui.filter.querySelector('option[value="extractor"]').textContent = t('filterExtractors');
     ui.filter.querySelector('option[value="subs"]').textContent = t('filterSubs');
     ui.filter.querySelector('option[value="other"]').textContent = t('filterOther');
 
@@ -1471,6 +1814,7 @@
           it.type === 'audio' ? t('filterAudio') :
           it.type === 'video' ? t('filterVideo') :
             it.type === 'playlist' ? t('filterPlaylists') :
+              it.type === 'extractor' ? t('filterExtractors') :
               it.type === 'subs' ? t('filterSubs') : t('filterOther');
 
       const mime = meta.mime ? clip(meta.mime, 70) : t('unknown');
@@ -1478,6 +1822,7 @@
       const from = meta.from && meta.from.size ? Array.from(meta.from).join(', ') : '';
       const note = meta.note ? meta.note : t('unknown');
       const canPreview = (it.type === 'audio' || it.type === 'video' || it.type === 'image') && !isTsSegment(it.url);
+      const isExtractor = it.type === 'extractor';
       const isSelected = state.previewUrl === it.url;
       const previewLabel = isSelected ? t('hidePreview') : t('preview');
 
@@ -1495,8 +1840,8 @@
           </div>
           <div class="mf_actions">
             ${canPreview ? `<button data-act="preview" data-type="${escapeAttr(it.type)}" data-url="${escapeAttr(it.url)}">${previewLabel}</button>` : ''}
-            <button data-act="open" data-url="${escapeAttr(it.url)}">${t('open')}</button>
-            <button data-act="download" data-url="${escapeAttr(it.url)}">${t('download')}</button>
+            <button data-act="open" data-url="${escapeAttr(it.url)}">${isExtractor ? t('openPage') : t('open')}</button>
+            ${isExtractor ? `<button data-act="probe" data-url="${escapeAttr(it.url)}">${t('probe')}</button><button data-act="copycmd" data-url="${escapeAttr(it.url)}">${t('copyCommand')}</button>` : `<button data-act="download" data-url="${escapeAttr(it.url)}">${t('download')}</button>`}
             <button data-act="copy" data-url="${escapeAttr(it.url)}">${t('copy')}</button>
           </div>
         </div>
@@ -1514,6 +1859,8 @@
         if (act === 'open') openUrl(url);
         else if (act === 'copy') copyOne(url);
         else if (act === 'download') downloadUrl(url);
+        else if (act === 'probe') probeBridgeForUrl(url, true);
+        else if (act === 'copycmd') copyCommand(url);
         else if (act === 'preview') togglePreview(url, type);
       };
     });
@@ -1684,6 +2031,42 @@
     return plain || 'download';
   }
 
+  function shellQuote(s) {
+    return `"${String(s || '').replace(/(["\\`$])/g, '\\$1')}"`;
+  }
+
+  function buildYtDlpCommand(url) {
+    const args = ['yt-dlp'];
+    if (state.ytDlpMode === 'audio') {
+      args.push('-f', 'bestaudio/best');
+    } else if (state.ytDlpMode === 'extract') {
+      args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
+    } else {
+      args.push('-f', 'bv*+ba/b');
+    }
+
+    if (state.ytDlpSubs) args.push('--write-subs', '--sub-langs', 'all');
+    if (state.ytDlpThumbs) args.push('--write-thumbnail');
+
+    const custom = String(state.ytDlpCustomArgs || '').trim();
+    if (custom) args.push(custom);
+
+    args.push(shellQuote(url));
+    return args.join(' ');
+  }
+
+  async function copyCommand(url) {
+    const cmd = buildYtDlpCommand(url);
+    try {
+      await navigator.clipboard.writeText(cmd);
+      ensureUI();
+      if (ui?.msgEl) ui.msgEl.textContent = t('commandCopied');
+    } catch {
+      ensureUI();
+      if (ui?.msgEl) ui.msgEl.textContent = t('clipboardBlocked');
+    }
+  }
+
   function downloadUrl(url) {
     const name = guessFileName(url);
     try {
@@ -1835,6 +2218,7 @@
           type === 'audio' ? t('filterAudio') :
           type === 'video' ? t('filterVideo') :
             type === 'playlist' ? t('filterPlaylists') :
+              type === 'extractor' ? t('filterExtractors') :
               type === 'subs' ? t('filterSubs') : t('filterOther');
 
       const from = meta.from && meta.from.size ? Array.from(meta.from).join(', ') : '';
