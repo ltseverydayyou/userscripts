@@ -1,12 +1,15 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.7.0
 // @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing, extractor-page detection, and richer download UX
 // @match        *://*/*
+// @noframes
 // @run-at       document-start
 // @grant        GM_openInTab
 // @grant        GM_download
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
@@ -16,6 +19,20 @@
 
 (function () {
   'use strict';
+
+  if (window.top !== window.self) return;
+
+  const INSTANCE_KEY = '__media_finder_singleton__';
+  if (globalThis[INSTANCE_KEY]) return;
+  globalThis[INSTANCE_KEY] = true;
+
+  const GITHUB_URL = 'https://github.com/ltseverydayyou';
+  const GITHUB_HANDLE = '@ltseverydayyou';
+  const GITHUB_ICON_SVG = `
+    <svg class="mf_brandicon" viewBox="0 0 32 32" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+      <path fill-rule="evenodd" clip-rule="evenodd" d="M16 0C7.16 0 0 7.16 0 16C0 23.08 4.58 29.06 10.94 31.18C11.74 31.32 12.04 30.84 12.04 30.42C12.04 30.04 12.02 28.78 12.02 27.44C8 28.18 6.96 26.46 6.64 25.56C6.46 25.1 5.68 23.68 5 23.3C4.44 23 3.64 22.26 4.98 22.24C6.24 22.22 7.14 23.4 7.44 23.88C8.88 26.3 11.18 25.62 12.1 25.2C12.24 24.16 12.66 23.46 13.12 23.06C9.56 22.66 5.84 21.28 5.84 15.16C5.84 13.42 6.46 11.98 7.48 10.86C7.32 10.46 6.76 8.82 7.64 6.62C7.64 6.62 8.98 6.2 12.04 8.26C13.32 7.9 14.68 7.72 16.04 7.72C17.4 7.72 18.76 7.9 20.04 8.26C23.1 6.18 24.44 6.62 24.44 6.62C25.32 8.82 24.76 10.46 24.6 10.86C25.62 11.98 26.24 13.4 26.24 15.16C26.24 21.3 22.5 22.66 18.94 23.06C19.52 23.56 20.02 24.52 20.02 26.02C20.02 28.16 20 29.88 20 30.42C20 30.84 20.3 31.34 21.1 31.18C27.42 29.06 32 23.06 32 16C32 7.16 24.84 0 16 0V0Z" fill="currentColor"/>
+    </svg>
+  `;
 
   const CFG = {
     maxItems: 2500,
@@ -89,6 +106,7 @@
   const styleSigSeen = new WeakMap();
   const scriptSigSeen = new WeakMap();
   const jsonLdSigSeen = new WeakMap();
+  const clearedBaselineUrls = new Set();
 
   const found = new Map(); // url -> {ts, from:Set, mime?, size?, note?, kind?}
   const players = new Map(); // el -> {tag, src, last, why:Set}
@@ -120,7 +138,10 @@
       copyAll: 'Copy all',
       preview: 'Preview',
       hidePreview: 'Hide preview',
+      previewUnavailable: 'Preview not available',
       clear: 'Clear',
+      customize: 'Customize',
+      customizeHide: 'Hide controls',
       search: 'Search…',
       filterAll: 'All',
       filterImages: 'Images',
@@ -152,7 +173,7 @@
       viewList: 'List view',
       viewGrid: 'Grid view',
       previewPane: 'Preview',
-      selectPreview: 'Select an item to preview on the right.',
+      selectPreview: 'Select an item to preview in the side window.',
       launcherHide: 'Hide toggle button',
       launcherShow: 'Show toggle button',
       layout: 'Layout',
@@ -169,7 +190,35 @@
       openPage: 'Open page',
       probe: 'Probe',
       probing: 'Probing',
-      bridgeDown: 'Bridge offline'
+      bridgeDown: 'Bridge offline',
+      followGithub: 'Open GitHub profile',
+      theme: 'Theme',
+      themeMidnight: 'Midnight',
+      themeNeon: 'Neon dusk',
+      themeAurora: 'Aurora',
+      motion: 'Motion',
+      motionOff: 'Off',
+      motionCalm: 'Calm',
+      motionFull: 'Full',
+      dockSide: 'Dock',
+      dockRight: 'Right',
+      dockLeft: 'Left',
+      panelWidth: 'Width',
+      widthNarrow: 'Narrow',
+      widthNormal: 'Normal',
+      widthWide: 'Wide',
+      widthUltra: 'Ultra',
+      panelHeight: 'Height',
+      heightCompact: 'Compact',
+      heightNormal: 'Normal',
+      heightTall: 'Tall',
+      heightFull: 'Full',
+      listType: 'Type',
+      listUrl: 'URL',
+      listMime: 'MIME',
+      listSize: 'Size',
+      listNote: 'Note',
+      listFrom: 'From'
     },
     bg: {
       title: 'Търсач на медия',
@@ -181,13 +230,19 @@
       close: 'Затвори',
       copy: 'Копирай',
       copyAll: 'Копирай всички',
+      preview: 'Преглед',
+      hidePreview: 'Скрий прегледа',
+      previewUnavailable: 'Прегледът не е наличен',
       clear: 'Изчисти',
+      customize: 'Персонализирай',
+      customizeHide: 'Скрий контролите',
       search: 'Търсене…',
       filterAll: 'Всички',
-      filterImages: 'Images',
+      filterImages: 'Изображения',
       filterAudio: 'Аудио',
       filterVideo: 'Видео',
       filterPlaylists: 'Плейлисти',
+      filterExtractors: 'Страници',
       filterSubs: 'Субтитри',
       filterOther: 'Други',
       settings: 'Настройки',
@@ -198,8 +253,8 @@
       uniqueFirst: 'Първо уникални',
       export: 'Експорт .txt',
       openList: 'Отвори списък',
-      tip: 'Tip: scroll/load more and press play. This tracker captures images, audio, video, HLS and DASH links.',
-      noneYet: 'No media links yet. Scroll/load content or press play, then wait a second.',
+      tip: 'Съвет: скролни или зареди още и пусни нещо. Този тракер хваща изображения, аудио, видео, HLS и DASH връзки.',
+      noneYet: 'Още няма намерени медийни връзки. Скролни, зареди съдържание или пусни нещо и изчакай секунда.',
       clipboardBlocked: 'Клипбордът е блокиран — ползвай „Отвори списък“',
       copied: 'Копирани',
       items: 'елемент(а)',
@@ -207,14 +262,15 @@
       toast: 'Тост',
       on: 'Вкл',
       off: 'Изкл',
-      unknown: 'Unknown',
-      viewList: 'List view',
-      viewGrid: 'Grid view',
-      previewPane: 'Preview',
-      selectPreview: 'Select an item to preview on the right.',
-      launcherHide: 'Hide toggle button',
-      launcherShow: 'Show toggle button',
-      layout: 'Layout',
+      download: 'Свали',
+      unknown: 'Неизвестно',
+      viewList: 'Списък',
+      viewGrid: 'Мрежа',
+      previewPane: 'Преглед',
+      selectPreview: 'Избери елемент за преглед в отделния панел.',
+      launcherHide: 'Скрий бутона',
+      launcherShow: 'Покажи бутона',
+      layout: 'Изглед',
       ytDlpOptions: 'yt-dlp',
       ytDlpModeVideo: 'Video cmd',
       ytDlpModeAudio: 'Audio cmd',
@@ -222,13 +278,41 @@
       ytDlpSubs: 'Subs',
       ytDlpThumbs: 'Thumbs',
       ytDlpCustomArgs: 'yt-dlp args...',
-      copyCommand: 'Copy cmd',
-      commandCopied: 'Command copied',
-      extractorPage: 'Extractor page',
-      openPage: 'Open page',
-      probe: 'Probe',
-      probing: 'Probing',
-      bridgeDown: 'Bridge offline'
+      copyCommand: 'Копирай команда',
+      commandCopied: 'Командата е копирана',
+      extractorPage: 'Страница за извличане',
+      openPage: 'Отвори страницата',
+      probe: 'Провери',
+      probing: 'Проверяване',
+      bridgeDown: 'Локалният bridge е офлайн',
+      followGithub: 'Отвори GitHub профила',
+      theme: 'Тема',
+      themeMidnight: 'Полунощ',
+      themeNeon: 'Неонов здрач',
+      themeAurora: 'Аврора',
+      motion: 'Анимация',
+      motionOff: 'Изкл',
+      motionCalm: 'Спокойна',
+      motionFull: 'Пълна',
+      dockSide: 'Панел',
+      dockRight: 'Вдясно',
+      dockLeft: 'Вляво',
+      panelWidth: 'Ширина',
+      widthNarrow: 'Тясна',
+      widthNormal: 'Нормална',
+      widthWide: 'Широка',
+      widthUltra: 'Много широка',
+      panelHeight: 'Височина',
+      heightCompact: 'Компактна',
+      heightNormal: 'Нормална',
+      heightTall: 'Висока',
+      heightFull: 'Макс',
+      listType: 'Тип',
+      listUrl: 'URL',
+      listMime: 'MIME',
+      listSize: 'Размер',
+      listNote: 'Бележка',
+      listFrom: 'Източник'
     }
   };
 
@@ -246,16 +330,46 @@
     ytDlpThumbs: false,
     ytDlpCustomArgs: '',
     launcherVisible: true,
+    customizerOpen: false,
+    theme: 'midnight',
+    motion: 'full',
+    dockSide: 'right',
+    panelWidth: 'normal',
+    panelHeight: 'normal',
     previewUrl: '',
     previewType: ''
   };
   loadState();
 
+  function readStoredState() {
+    try {
+      if (typeof GM_getValue === 'function') return GM_getValue(STORAGE_KEY, '');
+    } catch { }
+    try {
+      return localStorage.getItem(STORAGE_KEY);
+    } catch { }
+    return '';
+  }
+
+  function writeStoredState(raw) {
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(STORAGE_KEY, raw);
+        return true;
+      }
+    } catch { }
+    try {
+      localStorage.setItem(STORAGE_KEY, raw);
+      return true;
+    } catch { }
+    return false;
+  }
+
   function loadState() {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = readStoredState();
       if (!raw) return;
-      const parsed = JSON.parse(raw);
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (parsed && typeof parsed === 'object') applySavedState(parsed);
     } catch { }
   }
@@ -267,6 +381,11 @@
     const okSort = new Set(['newest', 'oldest', 'unique']);
     const okLayout = new Set(['list', 'grid']);
     const okYtMode = new Set(['video', 'audio', 'extract']);
+    const okTheme = new Set(['midnight', 'neon', 'aurora']);
+    const okMotion = new Set(['off', 'calm', 'full']);
+    const okDockSide = new Set(['right', 'left']);
+    const okPanelWidth = new Set(['narrow', 'normal', 'wide', 'ultra']);
+    const okPanelHeight = new Set(['compact', 'normal', 'tall', 'full']);
 
     if (okLang.has(saved.lang)) state.lang = saved.lang;
     if (okFilter.has(saved.filter)) state.filter = saved.filter;
@@ -281,6 +400,12 @@
     if (typeof saved.ytDlpThumbs === 'boolean') state.ytDlpThumbs = saved.ytDlpThumbs;
     if (typeof saved.ytDlpCustomArgs === 'string') state.ytDlpCustomArgs = saved.ytDlpCustomArgs;
     if (typeof saved.launcherVisible === 'boolean') state.launcherVisible = saved.launcherVisible;
+    if (typeof saved.customizerOpen === 'boolean') state.customizerOpen = saved.customizerOpen;
+    if (okTheme.has(saved.theme)) state.theme = saved.theme;
+    if (okMotion.has(saved.motion)) state.motion = saved.motion;
+    if (okDockSide.has(saved.dockSide)) state.dockSide = saved.dockSide;
+    if (okPanelWidth.has(saved.panelWidth)) state.panelWidth = saved.panelWidth;
+    if (okPanelHeight.has(saved.panelHeight)) state.panelHeight = saved.panelHeight;
   }
 
   function saveState() {
@@ -298,9 +423,15 @@
         ytDlpSubs: !!state.ytDlpSubs,
         ytDlpThumbs: !!state.ytDlpThumbs,
         ytDlpCustomArgs: state.ytDlpCustomArgs || '',
-        launcherVisible: !!state.launcherVisible
+        launcherVisible: !!state.launcherVisible,
+        customizerOpen: !!state.customizerOpen,
+        theme: state.theme,
+        motion: state.motion,
+        dockSide: state.dockSide,
+        panelWidth: state.panelWidth,
+        panelHeight: state.panelHeight
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      writeStoredState(JSON.stringify(payload));
     } catch { }
   }
 
@@ -326,6 +457,76 @@
   }
 
   function now() { return Date.now(); }
+
+  function rememberClearedUrl(raw) {
+    const u = norm(raw);
+    if (u) clearedBaselineUrls.add(u);
+  }
+
+  function rememberClearedUrls(values) {
+    try {
+      for (const value of values || []) rememberClearedUrl(value);
+    } catch { }
+  }
+
+  function buildClearBaseline() {
+    clearedBaselineUrls.clear();
+    rememberClearedUrl(location.href);
+
+    try {
+      rememberClearedUrl(document.querySelector('link[rel="canonical"]')?.getAttribute('href') || '');
+      rememberClearedUrl(document.querySelector('meta[property="og:url"],meta[name="og:url"]')?.getAttribute('content') || '');
+    } catch { }
+
+    try {
+      rememberClearedUrls(found.keys());
+    } catch { }
+
+    try {
+      for (const info of players.values()) {
+        if (info?.src) rememberClearedUrl(info.src);
+      }
+    } catch { }
+
+    try {
+      performance.getEntriesByType('resource').forEach((entry) => {
+        if (entry?.name) rememberClearedUrl(entry.name);
+      });
+    } catch { }
+
+    try {
+      const nodes = document.querySelectorAll('video,audio,img,picture,source,track,link[href],[src],[href],[poster],[srcset],[data-src],[data-href],[data-url],[data-image],[data-img],[data-original],[data-lazy-src],[data-thumb],[data-thumbnail],[data-poster],[data-srcset],style,[style*="url("]');
+      nodes.forEach(n => {
+        const tg = n.tagName?.toLowerCase?.() || '';
+        if (tg === 'video' || tg === 'audio' || tg === 'img') {
+          rememberClearedUrl(getMediaSrc(n));
+        }
+
+        [
+          'src', 'href', 'poster', 'data-src', 'data-href', 'data-url',
+          'data-image', 'data-img', 'data-original', 'data-lazy-src',
+          'data-thumb', 'data-thumbnail', 'data-poster'
+        ].forEach(attr => {
+          const val = n.getAttribute && n.getAttribute(attr);
+          if (val) rememberClearedUrl(val);
+        });
+
+        ['srcset', 'data-srcset'].forEach(attr => {
+          const val = n.getAttribute && n.getAttribute(attr);
+          if (!val) return;
+          rememberClearedUrls(parseSrcset(val));
+        });
+
+        if (n.hasAttribute && n.hasAttribute('style')) {
+          rememberClearedUrls(extractCssUrls(n.getAttribute('style') || ''));
+        }
+
+        if (tg === 'style') {
+          rememberClearedUrls(extractCssUrls(n.textContent || ''));
+        }
+      });
+    } catch { }
+  }
 
   function norm(u) {
     if (!u) return null;
@@ -781,6 +982,7 @@
   function add(raw, meta) {
     const u = norm(raw);
     if (!u) return;
+    if (clearedBaselineUrls.has(u)) return;
     try {
       if (u === PAGE_URL) return; // skip current page URL masquerading as media (e.g., MSE notifications)
     } catch {}
@@ -1305,27 +1507,202 @@
 
     const style = document.createElement('style');
     style.textContent = `
+      :host {
+        --mf-bg: rgba(12, 6, 24, .96);
+        --mf-bg-strong: rgba(22, 10, 39, .98);
+        --mf-surface: rgba(50, 20, 78, .38);
+        --mf-surface-strong: rgba(35, 13, 61, .82);
+        --mf-surface-soft: rgba(91, 33, 182, .18);
+        --mf-border: rgba(196, 181, 253, .22);
+        --mf-border-strong: rgba(216, 180, 254, .48);
+        --mf-text: #f5ebff;
+        --mf-text-soft: rgba(245, 235, 255, .76);
+        --mf-accent: #c084fc;
+        --mf-accent-strong: #8b5cf6;
+        --mf-link: #e9d5ff;
+        --mf-shadow: 0 26px 80px rgba(5, 2, 13, .6);
+        --mf-dur-fast: 160ms;
+        --mf-dur-med: 260ms;
+        --mf-dur-slow: 420ms;
+        --mf-stagger-step: 26ms;
+        --mf-ease: cubic-bezier(.2,.8,.2,1);
+        --mf-float-y: 12px;
+        --mf-stage-max: 1420px;
+        --mf-panel-max: 980px;
+        --mf-panel-height: min(720px, calc(100dvh - 24px));
+        --mf-preview-height: min(720px, calc(100dvh - 24px));
+        --mf-glow: 0 0 0 1px rgba(192,132,252,.18), 0 22px 52px rgba(8,3,19,.42);
+        --mf-backdrop: rgba(3,1,8,.58);
+        --mf-launcher-grad-a: rgba(192,132,252,.22);
+        --mf-launcher-top: rgba(25,12,43,.96);
+        --mf-launcher-bottom: rgba(10,6,21,.98);
+        --mf-panel-glow-a: rgba(192,132,252,.16);
+        --mf-panel-glow-b: rgba(124,58,237,.12);
+        --mf-panel-top: rgba(28,11,47,.98);
+        --mf-panel-bottom: rgba(10,6,21,.98);
+        --mf-dock-glow: rgba(216,180,254,.16);
+        --mf-dock-top: rgba(30,12,50,.98);
+        --mf-dock-bottom: rgba(9,6,20,.98);
+        --mf-card-top: rgba(34, 13, 57, .72);
+        --mf-card-bottom: rgba(18, 8, 33, .76);
+        --mf-control-bg: rgba(53, 19, 86, .82);
+        --mf-control-bg-soft: rgba(38, 15, 63, .72);
+        --mf-brand-bg: rgba(59, 26, 96, .72);
+        --mf-badge-bg: rgba(69, 28, 112, .55);
+        --mf-preview-player-top: rgba(18, 9, 32, .98);
+        --mf-preview-player-bottom: rgba(8, 5, 18, 1);
+      }
+      :host([data-theme="neon"]) {
+        --mf-bg: rgba(22, 5, 28, .96);
+        --mf-bg-strong: rgba(32, 8, 38, .98);
+        --mf-surface: rgba(121, 24, 72, .34);
+        --mf-surface-strong: rgba(73, 14, 73, .84);
+        --mf-surface-soft: rgba(244, 114, 182, .18);
+        --mf-border: rgba(251, 207, 232, .2);
+        --mf-border-strong: rgba(244, 114, 182, .44);
+        --mf-text: #fff1f7;
+        --mf-text-soft: rgba(255, 241, 247, .76);
+        --mf-accent: #fb7185;
+        --mf-accent-strong: #ec4899;
+        --mf-link: #fecdd3;
+        --mf-backdrop: rgba(18, 2, 14, .64);
+        --mf-launcher-grad-a: rgba(244,114,182,.28);
+        --mf-launcher-top: rgba(63, 12, 38, .96);
+        --mf-launcher-bottom: rgba(24, 5, 22, .98);
+        --mf-panel-glow-a: rgba(244,114,182,.22);
+        --mf-panel-glow-b: rgba(190,24,93,.14);
+        --mf-panel-top: rgba(61,10,42,.98);
+        --mf-panel-bottom: rgba(20,4,20,.98);
+        --mf-dock-glow: rgba(251,207,232,.18);
+        --mf-dock-top: rgba(69,12,47,.98);
+        --mf-dock-bottom: rgba(23,4,20,.98);
+        --mf-card-top: rgba(87, 15, 55, .74);
+        --mf-card-bottom: rgba(35, 7, 26, .8);
+        --mf-control-bg: rgba(118, 21, 75, .82);
+        --mf-control-bg-soft: rgba(77, 13, 53, .74);
+        --mf-brand-bg: rgba(122, 20, 73, .74);
+        --mf-badge-bg: rgba(136, 24, 84, .55);
+        --mf-preview-player-top: rgba(42, 8, 28, .98);
+        --mf-preview-player-bottom: rgba(18, 4, 16, 1);
+        --mf-glow: 0 0 0 1px rgba(251,113,133,.18), 0 22px 52px rgba(24,4,20,.42);
+      }
+      :host([data-theme="aurora"]) {
+        --mf-bg: rgba(7, 14, 24, .96);
+        --mf-bg-strong: rgba(10, 22, 33, .98);
+        --mf-surface: rgba(14, 116, 144, .28);
+        --mf-surface-strong: rgba(12, 74, 110, .82);
+        --mf-surface-soft: rgba(45, 212, 191, .16);
+        --mf-border: rgba(153, 246, 228, .18);
+        --mf-border-strong: rgba(34, 211, 238, .4);
+        --mf-text: #ebfffe;
+        --mf-text-soft: rgba(235, 255, 254, .74);
+        --mf-accent: #2dd4bf;
+        --mf-accent-strong: #06b6d4;
+        --mf-link: #99f6e4;
+        --mf-backdrop: rgba(2, 10, 14, .62);
+        --mf-launcher-grad-a: rgba(45,212,191,.22);
+        --mf-launcher-top: rgba(9, 40, 50, .96);
+        --mf-launcher-bottom: rgba(5, 18, 28, .98);
+        --mf-panel-glow-a: rgba(45,212,191,.18);
+        --mf-panel-glow-b: rgba(6,182,212,.12);
+        --mf-panel-top: rgba(10, 44, 58, .98);
+        --mf-panel-bottom: rgba(5, 20, 30, .98);
+        --mf-dock-glow: rgba(153,246,228,.16);
+        --mf-dock-top: rgba(9, 51, 61, .98);
+        --mf-dock-bottom: rgba(4, 18, 25, .98);
+        --mf-card-top: rgba(12, 77, 88, .58);
+        --mf-card-bottom: rgba(8, 34, 41, .78);
+        --mf-control-bg: rgba(14, 96, 107, .72);
+        --mf-control-bg-soft: rgba(9, 63, 72, .72);
+        --mf-brand-bg: rgba(11, 95, 105, .74);
+        --mf-badge-bg: rgba(10, 115, 122, .52);
+        --mf-preview-player-top: rgba(7, 31, 39, .98);
+        --mf-preview-player-bottom: rgba(4, 16, 24, 1);
+        --mf-glow: 0 0 0 1px rgba(45,212,191,.16), 0 22px 52px rgba(4,16,24,.4);
+      }
+      :host([data-motion="calm"]) {
+        --mf-dur-fast: 120ms;
+        --mf-dur-med: 180ms;
+        --mf-dur-slow: 260ms;
+        --mf-stagger-step: 10ms;
+        --mf-float-y: 6px;
+      }
+      :host([data-motion="off"]) {
+        --mf-dur-fast: 1ms;
+        --mf-dur-med: 1ms;
+        --mf-dur-slow: 1ms;
+        --mf-stagger-step: 0ms;
+        --mf-float-y: 0px;
+      }
+      :host([data-dock-side="left"]) .mf_stage {
+        flex-direction: row-reverse;
+      }
+      :host([data-panel-width="wide"]) {
+        --mf-stage-max: 1540px;
+        --mf-panel-max: 1100px;
+      }
+      :host([data-panel-width="narrow"]) {
+        --mf-stage-max: 1280px;
+        --mf-panel-max: 860px;
+      }
+      :host([data-panel-width="ultra"]) {
+        --mf-stage-max: 1680px;
+        --mf-panel-max: 1240px;
+      }
+      :host([data-panel-height="compact"]) {
+        --mf-panel-height: min(620px, calc(100dvh - 24px));
+        --mf-preview-height: min(620px, calc(100dvh - 24px));
+      }
+      :host([data-panel-height="tall"]) {
+        --mf-panel-height: min(820px, calc(100dvh - 24px));
+        --mf-preview-height: min(820px, calc(100dvh - 24px));
+      }
+      :host([data-panel-height="full"]) {
+        --mf-panel-height: calc(100dvh - 24px);
+        --mf-preview-height: calc(100dvh - 24px);
+      }
       :host, * { box-sizing: border-box; }
+      @keyframes mfRise {
+        from { opacity: 0; transform: translateY(var(--mf-float-y)) scale(.985); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
+      }
+      @keyframes mfGlowSweep {
+        0% { box-shadow: 0 0 0 rgba(0,0,0,0); }
+        50% { box-shadow: 0 0 0 1px rgba(255,255,255,.04), 0 16px 44px rgba(8,3,19,.42); }
+        100% { box-shadow: 0 0 0 rgba(0,0,0,0); }
+      }
+      @keyframes mfPulseDot {
+        0%, 100% { transform: scale(1); opacity: .95; }
+        50% { transform: scale(1.28); opacity: .7; }
+      }
+      @keyframes mfNameShift {
+        0% { background-position: 0% 50%; }
+        100% { background-position: 200% 50%; }
+      }
       .mf_btn {
         position: fixed; right: 12px; bottom: 12px; z-index: 2147483647;
-        background: rgba(2,6,23,.92); color: #e5e7eb;
-        border: 1px solid rgba(148,163,184,.35); border-radius: 14px;
-        padding: 10px 12px; cursor: pointer; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
-        display:flex; align-items:center; gap:10px; box-shadow: 0 12px 34px rgba(0,0,0,.38);
-        backdrop-filter: blur(10px);
-        transition: transform .24s ease, box-shadow .24s ease, opacity .24s ease;
+        background:
+          radial-gradient(circle at top left, var(--mf-launcher-grad-a), transparent 48%),
+          linear-gradient(180deg, var(--mf-launcher-top), var(--mf-launcher-bottom));
+        color: var(--mf-text);
+        border: 1px solid var(--mf-border-strong); border-radius: 16px;
+        padding: 10px 14px; cursor: pointer; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+        display:flex; align-items:center; gap:10px; box-shadow: 0 18px 44px rgba(6,2,14,.48);
+        backdrop-filter: blur(14px);
+        transition: transform var(--mf-dur-med) var(--mf-ease), box-shadow var(--mf-dur-med) var(--mf-ease), opacity var(--mf-dur-fast) linear;
       }
-      .mf_btn:hover { transform: translateY(-2px); box-shadow: 0 14px 38px rgba(0,0,0,.42); }
+      .mf_btn:hover { transform: translateY(-2px); box-shadow: 0 22px 52px rgba(6,2,14,.56); }
       .mf_btn.mf_btn_hidden { transform: translateX(85%) translateY(0); opacity:.35; pointer-events:auto; }
       .mf_btn .mf_toggle {
         width: 20px; height: 20px; border-radius: 999px;
-        border: 1px solid rgba(148,163,184,.45);
+        border: 1px solid var(--mf-border-strong);
         display:grid; place-items:center;
         font-weight: 700; font-size: 12px; line-height: 1;
-        background: rgba(15,23,42,.9);
-        transition: background .24s ease, color .24s ease;
+        background: var(--mf-control-bg);
+        transition: background var(--mf-dur-fast) var(--mf-ease), color var(--mf-dur-fast) var(--mf-ease), transform var(--mf-dur-fast) var(--mf-ease);
       }
-      .mf_dot { width: 8px; height: 8px; border-radius: 99px; background: #38bdf8; opacity: .9; }
+      .mf_btn:hover .mf_toggle { transform: rotate(8deg) scale(1.06); }
+      .mf_dot { width: 8px; height: 8px; border-radius: 99px; background: var(--mf-accent); opacity: .95; box-shadow: 0 0 18px var(--mf-accent); animation: mfPulseDot 1.8s ease-in-out infinite; }
       .mf_cnt { font-variant-numeric: tabular-nums; opacity: .95; }
       .mf_toast {
         position: fixed; left: 50%; top: 12px; transform: translateX(-50%);
@@ -1334,174 +1711,320 @@
       }
       .mf_toast > div{
         pointer-events: auto;
-        background: rgba(2,6,23,.92); color:#e5e7eb;
-        border: 1px solid rgba(148,163,184,.35);
+        background:
+          radial-gradient(circle at top left, var(--mf-launcher-grad-a), transparent 50%),
+          linear-gradient(180deg, var(--mf-launcher-top), var(--mf-launcher-bottom));
+        color: var(--mf-text);
+        border: 1px solid var(--mf-border-strong);
         border-radius: 14px; padding: 10px 12px;
         display:flex; gap:10px; align-items:center;
-        box-shadow: 0 12px 34px rgba(0,0,0,.38);
-        backdrop-filter: blur(10px);
+        box-shadow: 0 18px 44px rgba(6,2,14,.44);
+        backdrop-filter: blur(14px);
         font: 13px system-ui,-apple-system,"Segoe UI",sans-serif;
       }
-      .mf_toast .msg { flex: 1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow: ellipsis; opacity:.95; }
+      .mf_toast .msg { flex: 1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow: ellipsis; color: var(--mf-text-soft); }
       .mf_toast button {
-        background: rgba(15,23,42,.9); color:#e5e7eb;
-        border: 1px solid rgba(148,163,184,.35); border-radius: 12px;
+        background: var(--mf-control-bg); color: var(--mf-text);
+        border: 1px solid var(--mf-border); border-radius: 12px;
         padding: 7px 10px; cursor:pointer; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
       }
       .mf_backdrop {
         position: fixed; inset: 0; z-index: 2147483647;
-        background: rgba(0,0,0,.45); backdrop-filter: blur(6px);
+        background: var(--mf-backdrop); backdrop-filter: blur(10px);
         display:none; align-items:center; justify-content:center;
+        padding: 12px;
         opacity: 0; pointer-events: none; transition: opacity .22s ease;
+        overflow: auto;
       }
       .mf_backdrop.mf_visible { opacity: 1; pointer-events: auto; }
+      .mf_stage {
+        width: min(var(--mf-stage-max), calc(100vw - 24px));
+        display:flex;
+        align-items:stretch;
+        justify-content:center;
+        gap: 16px;
+        margin: auto;
+      }
       .mf_panel {
+        flex: 1 1 auto;
         width: min(980px, calc(100vw - 24px));
-        height: min(720px, calc(100vh - 24px));
-        background: rgba(2,6,23,.96); color:#e5e7eb;
-        border: 1px solid rgba(148,163,184,.35);
-        border-radius: 18px; box-shadow: 0 22px 70px rgba(0,0,0,.55);
+        max-width: var(--mf-panel-max);
+        height: var(--mf-panel-height);
+        background:
+          radial-gradient(circle at top left, var(--mf-panel-glow-a), transparent 32%),
+          radial-gradient(circle at bottom right, var(--mf-panel-glow-b), transparent 34%),
+          linear-gradient(180deg, var(--mf-panel-top), var(--mf-panel-bottom));
+        color: var(--mf-text);
+        border: 1px solid var(--mf-border-strong);
+        border-radius: 22px; box-shadow: var(--mf-shadow);
         display:flex; flex-direction:column; overflow:hidden;
         transform: translateY(12px) scale(.98);
         opacity: 0;
-        transition: transform .24s ease, opacity .24s ease;
+        transition: transform var(--mf-dur-med) var(--mf-ease), opacity var(--mf-dur-med) var(--mf-ease), box-shadow var(--mf-dur-med) var(--mf-ease);
       }
       .mf_backdrop.mf_visible .mf_panel { transform: translateY(0) scale(1); opacity: 1; }
+      .mf_previewdock {
+        flex: 0 0 min(400px, 31vw);
+        width: min(400px, 31vw);
+        max-height: var(--mf-preview-height);
+        min-height: 240px;
+        background:
+          radial-gradient(circle at top, var(--mf-dock-glow), transparent 34%),
+          linear-gradient(180deg, var(--mf-dock-top), var(--mf-dock-bottom));
+        color: var(--mf-text);
+        border: 1px solid var(--mf-border);
+        border-radius: 22px;
+        box-shadow: var(--mf-shadow);
+        display:none;
+        flex-direction:column;
+        overflow:hidden;
+        transform: translateY(12px) scale(.98);
+        opacity: 0;
+        transition: transform var(--mf-dur-med) var(--mf-ease), opacity var(--mf-dur-med) var(--mf-ease), box-shadow var(--mf-dur-med) var(--mf-ease);
+      }
+      .mf_previewdock.mf_open { display:flex; }
+      .mf_backdrop.mf_visible .mf_previewdock.mf_open { transform: translateY(0) scale(1); opacity: 1; }
       .mf_hdr {
-        padding: 12px 12px 10px 12px;
+        padding: 14px 14px 12px 14px;
         display:flex; gap:10px; align-items:center;
-        border-bottom: 1px solid rgba(148,163,184,.18);
+        border-bottom: 1px solid rgba(216,180,254,.16);
+      }
+      .mf_hdrmain {
+        display:flex;
+        align-items:center;
+        gap: 12px;
+        min-width: 0;
+      }
+      .mf_brandlink {
+        flex: 0 0 auto;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        width: 38px;
+        height: 38px;
+        border-radius: 14px;
+        border: 1px solid rgba(216,180,254,.28);
+        background: var(--mf-brand-bg);
+        overflow:hidden;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.05);
+      }
+      .mf_brandicon {
+        width: 22px;
+        height: 22px;
+        color: #fff;
+      }
+      .mf_titlegroup {
+        min-width: 0;
+        display:flex;
+        flex-direction:column;
+        gap: 3px;
+      }
+      .mf_titlebar {
+        display:flex;
+        align-items:center;
+        gap: 10px;
+        min-width: 0;
       }
       .mf_title { font: 600 14px system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:.2px; }
-      .mf_sub { opacity:.75; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; }
+      .mf_owner {
+        color: rgba(233,213,255,.86);
+        text-decoration:none;
+        font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+        white-space: nowrap;
+        background-image: linear-gradient(90deg, #3b1d78 0%, #7c3aed 38%, #a855f7 64%, #ec4899 100%);
+        background-size: 200% 100%;
+        background-clip: text;
+        -webkit-background-clip: text;
+        color: transparent;
+        -webkit-text-fill-color: transparent;
+        animation: mfNameShift 6.2s linear infinite;
+      }
+      :host([data-motion="off"]) .mf_owner { animation: none; background-position: 40% 50%; }
+      .mf_sub { color: var(--mf-text-soft); font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; }
       .mf_sp { flex:1; }
       .mf_iconbtn {
-        background: rgba(15,23,42,.9); color:#e5e7eb;
-        border: 1px solid rgba(148,163,184,.35);
-        border-radius: 12px; padding: 8px 10px; cursor:pointer;
+        background: var(--mf-control-bg); color: var(--mf-text);
+        border: 1px solid var(--mf-border);
+        border-radius: 14px; padding: 9px 11px; cursor:pointer;
         font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+        transition: transform var(--mf-dur-fast) var(--mf-ease), background var(--mf-dur-fast) var(--mf-ease), border-color var(--mf-dur-fast) var(--mf-ease), box-shadow var(--mf-dur-fast) var(--mf-ease);
       }
+      .mf_iconbtn:hover { transform: translateY(-1px); border-color: var(--mf-border-strong); box-shadow: 0 8px 22px rgba(8,3,19,.28); }
       .mf_row {
         padding: 10px 12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;
-        border-bottom: 1px solid rgba(148,163,184,.12);
+        border-bottom: 1px solid rgba(216,180,254,.12);
+      }
+      .mf_customizer {
+        margin: 10px 12px 0 12px;
+        padding: 12px;
+        border: 1px solid rgba(216,180,254,.12);
+        border-radius: 18px;
+        background:
+          radial-gradient(circle at top right, rgba(255,255,255,.05), transparent 36%),
+          linear-gradient(180deg, var(--mf-card-top), var(--mf-card-bottom));
+        display:none;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px;
+        animation: mfRise var(--mf-dur-slow) var(--mf-ease);
+      }
+      .mf_customizer.mf_open { display:grid; }
+      .mf_field {
+        min-width: 0;
+        display:flex;
+        flex-direction:column;
+        gap: 6px;
+      }
+      .mf_field label {
+        color: var(--mf-text-soft);
+        font: 11px system-ui,-apple-system,"Segoe UI",sans-serif;
+        text-transform: uppercase;
+        letter-spacing: .08em;
       }
       .mf_inp {
         flex: 1; min-width: 220px;
-        background: rgba(15,23,42,.65); color:#e5e7eb;
-        border: 1px solid rgba(148,163,184,.25); border-radius: 14px;
+        background: var(--mf-control-bg-soft); color: var(--mf-text);
+        border: 1px solid rgba(216,180,254,.18); border-radius: 14px;
         padding: 10px 12px; outline: none; font: 12.5px system-ui,-apple-system,"Segoe UI",sans-serif;
       }
       .mf_sel {
-        background: rgba(15,23,42,.65); color:#e5e7eb;
-        border: 1px solid rgba(148,163,184,.25); border-radius: 14px;
+        background: var(--mf-control-bg-soft); color: var(--mf-text);
+        border: 1px solid rgba(216,180,254,.18); border-radius: 14px;
         padding: 10px 10px; outline:none; font: 12.5px system-ui,-apple-system,"Segoe UI",sans-serif;
+        transition: border-color var(--mf-dur-fast) var(--mf-ease), box-shadow var(--mf-dur-fast) var(--mf-ease), transform var(--mf-dur-fast) var(--mf-ease);
       }
+      .mf_inp:focus,
+      .mf_sel:focus { border-color: var(--mf-border-strong); box-shadow: 0 0 0 4px rgba(192,132,252,.12); }
       .mf_body { flex:1; overflow:auto; padding: 8px 12px 12px 12px; display:flex; flex-direction:column; gap:6px; }
-      .mf_tip { opacity:.75; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; padding: 6px 2px 4px 2px; }
+      .mf_tip { color: var(--mf-text-soft); font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; padding: 6px 2px 4px 2px; }
       .mf_item {
-        border: 1px solid rgba(148,163,184,.16);
-        background: rgba(15,23,42,.35);
+        border: 1px solid rgba(216,180,254,.12);
+        background:
+          linear-gradient(180deg, var(--mf-card-top), var(--mf-card-bottom));
         border-radius: 16px;
         padding: 10px 10px;
         display:flex; gap:10px; align-items:flex-start;
         margin: 10px 0;
+        box-shadow: 0 1px 0 rgba(255,255,255,.02);
+        transition: transform var(--mf-dur-fast) var(--mf-ease), border-color var(--mf-dur-fast) var(--mf-ease), box-shadow var(--mf-dur-fast) var(--mf-ease), background var(--mf-dur-fast) var(--mf-ease);
       }
+      .mf_item:hover { transform: translateY(-2px); box-shadow: var(--mf-glow); border-color: rgba(216,180,254,.24); }
       .mf_badge {
         padding: 6px 10px; border-radius: 999px;
-        border: 1px solid rgba(148,163,184,.25);
-        background: rgba(2,6,23,.55);
+        border: 1px solid rgba(216,180,254,.22);
+        background: var(--mf-badge-bg);
         font: 600 11px system-ui,-apple-system,"Segoe UI",sans-serif;
         opacity:.9;
         min-width: 78px; text-align:center;
       }
       .mf_main { flex:1; min-width:0; }
       .mf_url {
-        color:#7dd3fc; text-decoration:none; word-break: break-all;
+        color: var(--mf-link); text-decoration:none; word-break: break-all;
         font: 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
       }
-      .mf_meta { margin-top: 6px; opacity:.72; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; }
+      .mf_meta { margin-top: 6px; color: var(--mf-text-soft); font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; }
       .mf_actions { display:flex; gap:8px; align-items:center; flex-wrap: wrap; justify-content:flex-end; }
       .mf_actions button{
-        background: rgba(15,23,42,.85); color:#e5e7eb;
-        border: 1px solid rgba(148,163,184,.25); border-radius: 12px;
+        background: var(--mf-control-bg); color: var(--mf-text);
+        border: 1px solid rgba(216,180,254,.2); border-radius: 12px;
         padding: 7px 10px; cursor:pointer; font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+        transition: transform var(--mf-dur-fast) var(--mf-ease), background var(--mf-dur-fast) var(--mf-ease), border-color var(--mf-dur-fast) var(--mf-ease), box-shadow var(--mf-dur-fast) var(--mf-ease);
       }
-      .mf_preview {
-        display:none;
-        width: 100%;
-        margin-top: 8px;
-        border: 1px solid rgba(148,163,184,.16);
-        background: rgba(2,6,23,.55);
-        border-radius: 12px;
-        padding: 8px;
-      }
-      .mf_preview video,
-      .mf_preview audio,
-      .mf_preview img {
-        width: 100%;
-        max-height: 240px;
-        border-radius: 10px;
-        background: #0b1220;
-      }
-      .mf_preview .mf_note {
-        font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
-        opacity: .75;
-      }
+      .mf_actions button:hover { transform: translateY(-1px); border-color: var(--mf-border-strong); box-shadow: 0 10px 20px rgba(8,3,19,.25); }
       .mf_compact .mf_item{ padding: 8px 10px; }
       .mf_compact .mf_meta{ display:none; }
-      .mf_split { display:grid; grid-template-columns: minmax(0, 1.45fr) 360px; gap: 12px; align-items:start; min-height:0; transition: grid-template-columns .22s ease; }
-      .mf_split.mf_no_preview { grid-template-columns: 1fr; }
-      .mf_split.mf_no_preview .mf_previewpanel { display:none; }
       .mf_listwrap { min-height:0; }
       .mf_listwrap .mf_item { margin: 10px 0; }
       .mf_listwrap.mf_grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
       .mf_listwrap.mf_grid .mf_item { margin: 0; flex-direction: column; align-items: stretch; }
       .mf_listwrap.mf_grid .mf_actions { justify-content:flex-start; }
-      .mf_item_selected { border-color: rgba(56,189,248,.6); box-shadow: 0 0 0 1px rgba(56,189,248,.2), 0 10px 30px rgba(0,0,0,.25); }
-      .mf_item_selected .mf_badge { border-color: rgba(56,189,248,.6); }
-      .mf_previewpanel {
-        position: sticky;
-        top: 8px;
-        align-self: start;
-        background: rgba(2,6,23,.7);
-        border: 1px solid rgba(148,163,184,.2);
-        border-radius: 14px;
-        padding: 10px;
-        min-height: 140px;
-        max-height: calc(100vh - 170px);
-        overflow: auto;
+      .mf_item_selected { border-color: rgba(216,180,254,.56); box-shadow: 0 0 0 1px rgba(192,132,252,.22), 0 14px 36px rgba(5,2,13,.34); }
+      .mf_item_selected .mf_badge { border-color: rgba(216,180,254,.56); }
+      .mf_previewdock.mf_peek {
+        box-shadow: 0 0 0 1px rgba(216,180,254,.4), 0 24px 48px rgba(5,2,13,.38);
+        animation: mfGlowSweep var(--mf-dur-slow) var(--mf-ease);
       }
-      .mf_previewpanel.mf_peek {
-        box-shadow: 0 0 0 1px rgba(56,189,248,.4), 0 18px 36px rgba(0,0,0,.28);
+      .mf_previewdock_hdr {
+        padding: 14px;
+        display:flex;
+        gap: 10px;
+        align-items:flex-start;
+        justify-content:space-between;
+        border-bottom: 1px solid rgba(216,180,254,.12);
+      }
+      .mf_previewdock_copy {
+        min-width: 0;
+        display:flex;
+        flex-direction:column;
+        gap: 4px;
+      }
+      .mf_previewdock_title {
+        font: 600 13px system-ui,-apple-system,"Segoe UI",sans-serif;
+      }
+      .mf_previewdock_sub {
+        color: var(--mf-text-soft);
+        font: 12px system-ui,-apple-system,"Segoe UI",sans-serif;
+        word-break: break-word;
+      }
+      .mf_previewdock_body {
+        flex:1;
+        overflow:auto;
+        padding: 14px;
       }
       .mf_preview_card { display:flex; flex-direction:column; gap:10px; }
       .mf_preview_header { display:flex; gap:8px; align-items:flex-start; justify-content:space-between; }
-      .mf_preview_header .mf_label { font: 600 13px system-ui,-apple-system,"Segoe UI",sans-serif; }
-      .mf_preview_meta { font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; opacity:.82; display:flex; flex-direction:column; gap:4px; word-break:break-word; }
+      .mf_preview_header .mf_label { font: 600 13px system-ui,-apple-system,"Segoe UI",sans-serif; color: var(--mf-accent); }
+      .mf_preview_meta { font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; color: var(--mf-text-soft); display:flex; flex-direction:column; gap:4px; word-break:break-word; }
       .mf_preview_player {
-        background: #0b1220;
-        border-radius: 12px;
-        padding: 8px;
-        border: 1px solid rgba(148,163,184,.16);
+        background: linear-gradient(180deg, var(--mf-preview-player-top), var(--mf-preview-player-bottom));
+        border-radius: 16px;
+        padding: 10px;
+        border: 1px solid rgba(216,180,254,.12);
       }
       .mf_preview_player video,
       .mf_preview_player audio,
       .mf_preview_player img {
         width: 100%;
-        max-height: 320px;
-        border-radius: 10px;
-        background: #0b1220;
+        max-height: 420px;
+        border-radius: 12px;
+        background: #0e0917;
       }
-      .mf_preview_empty { font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; opacity:.72; }
-      @media (max-width: 860px) {
-        .mf_split { grid-template-columns: 1fr; }
-        .mf_previewpanel {
-          position: sticky;
-          top: 8px;
-          order: -1;
-          margin-bottom: 10px;
-          max-height: 40vh;
+      .mf_preview_empty { font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; color: var(--mf-text-soft); }
+      @media (max-width: 1180px) {
+        .mf_stage { gap: 12px; }
+        .mf_panel { max-width: none; }
+        .mf_previewdock { flex-basis: min(360px, 36vw); width: min(360px, 36vw); }
+      }
+      @media (max-width: 900px) {
+        .mf_backdrop { align-items:flex-start; padding: 8px; }
+        .mf_stage { width: 100%; flex-direction:column; }
+        :host([data-dock-side="left"]) .mf_stage { flex-direction:column; }
+        .mf_panel { width: 100%; height: min(var(--mf-panel-height), min(74dvh, 760px)); }
+        .mf_previewdock { width: 100%; flex-basis: auto; max-height: min(var(--mf-preview-height), min(44dvh, 420px)); }
+        .mf_row {
+          display:grid;
+          grid-template-columns: 1fr 1fr;
+          align-items:stretch;
         }
+        .mf_customizer { grid-template-columns: 1fr 1fr; }
+        .mf_inp { min-width: 0; grid-column: 1 / -1; }
+        .mf_iconbtn, .mf_sel { min-height: 42px; }
+      }
+      @media (max-width: 640px) {
+        .mf_btn { left: 10px; right: 10px; bottom: 10px; justify-content:center; }
+        .mf_toast { top: 8px; max-width: calc(100vw - 12px); }
+        .mf_toast > div { flex-wrap: wrap; }
+        .mf_backdrop { padding: 6px; }
+        .mf_panel { height: min(var(--mf-panel-height), calc(100dvh - 12px)); border-radius: 18px; }
+        .mf_previewdock { max-height: min(var(--mf-preview-height), calc(100dvh - 12px)); border-radius: 18px; }
+        .mf_hdr { flex-wrap: wrap; align-items:flex-start; }
+        .mf_hdrmain { width: 100%; }
+        .mf_titlebar { flex-wrap: wrap; }
+        .mf_row { grid-template-columns: 1fr; }
+        .mf_customizer { grid-template-columns: 1fr; }
+        .mf_item { flex-direction: column; }
+        .mf_badge { min-width: 0; width: fit-content; }
+        .mf_actions { width: 100%; justify-content:stretch; }
+        .mf_actions button { flex: 1 1 100%; min-height: 42px; }
       }
     `;
 
@@ -1520,53 +2043,115 @@
     const backdrop = document.createElement('div');
     backdrop.className = 'mf_backdrop';
     backdrop.innerHTML = `
-      <div class="mf_panel">
-        <div class="mf_hdr">
-          <div>
-            <div class="mf_title">${t('title')}</div>
-            <div class="mf_sub" id="__mf_sub__">${t('scanning')}</div>
+      <div class="mf_stage">
+        <div class="mf_panel">
+          <div class="mf_hdr">
+            <div class="mf_hdrmain">
+              <a class="mf_brandlink" href="${escapeAttr(GITHUB_URL)}" target="_blank" rel="noreferrer noopener" title="${escapeAttr(t('followGithub'))}">
+                ${GITHUB_ICON_SVG}
+              </a>
+              <div class="mf_titlegroup">
+                <div class="mf_titlebar">
+                  <div class="mf_title" id="__mf_title__">${t('title')}</div>
+                  <a class="mf_owner" id="__mf_owner__" href="${escapeAttr(GITHUB_URL)}" target="_blank" rel="noreferrer noopener">${escapeHtml(GITHUB_HANDLE)}</a>
+                </div>
+                <div class="mf_sub" id="__mf_sub__">${t('scanning')}</div>
+              </div>
+            </div>
+            <div class="mf_sp"></div>
+            <button class="mf_iconbtn" id="__mf_openlist__">${t('openList')}</button>
+            <button class="mf_iconbtn" id="__mf_copyall__">${t('copyAll')}</button>
+            <button class="mf_iconbtn" id="__mf_export__">${t('export')}</button>
+            <button class="mf_iconbtn" id="__mf_customize__">${t('customize')}</button>
+            <button class="mf_iconbtn" id="__mf_close__">${t('close')}</button>
           </div>
-          <div class="mf_sp"></div>
-          <button class="mf_iconbtn" id="__mf_openlist__" title="Open the full table in a new tab">${t('openList')}</button>
-          <button class="mf_iconbtn" id="__mf_copyall__" title="Copy all found URLs">${t('copyAll')}</button>
-          <button class="mf_iconbtn" id="__mf_export__" title="Save all URLs to a .txt file">${t('export')}</button>
-          <button class="mf_iconbtn" id="__mf_close__" title="Close the Media Finder panel">${t('close')}</button>
-        </div>
-        <div class="mf_row">
-          <input class="mf_inp" id="__mf_q__" placeholder="${t('search')}" />
-          <select class="mf_sel" id="__mf_filter__" title="Filter by media type">
-            <option value="all">${t('filterAll')}</option>
-            <option value="image">${t('filterImages')}</option>
-            <option value="audio">${t('filterAudio')}</option>
-            <option value="video">${t('filterVideo')}</option>
-            <option value="playlist">${t('filterPlaylists')}</option>
-            <option value="extractor">${t('filterExtractors')}</option>
-            <option value="subs">${t('filterSubs')}</option>
-            <option value="other">${t('filterOther')}</option>
-          </select>
-          <select class="mf_sel" id="__mf_sort__" title="Sort the list">
-            <option value="newest">${t('newest')}</option>
-            <option value="oldest">${t('oldest')}</option>
-            <option value="unique">${t('uniqueFirst')}</option>
-          </select>
-          <select class="mf_sel" id="__mf_lang__" title="UI language">
-            <option value="auto">${t('auto')}</option>
-            <option value="en">English</option>
-            <option value="bg">Български</option>
-          </select>
-          <button class="mf_iconbtn" id="__mf_compact__" title="Toggle compact list density">${t('compact')}</button>
-          <button class="mf_iconbtn" id="__mf_layout__" title="Switch between list and grid layouts">${t('viewList')}</button>
-          <button class="mf_iconbtn" id="__mf_toasttoggle__" title="Toggle toast notifications">${t('toast')}: ${t('on')}</button>
-          <button class="mf_iconbtn" id="__mf_clear__" title="Clear all detected entries">${t('clear')}</button>
-        </div>
-        <div class="mf_body" id="__mf_body__">
-          <div class="mf_tip" id="__mf_tip__">${t('tip')}</div>
-          <div class="mf_split mf_no_preview" id="__mf_split__">
-            <div class="mf_listwrap" id="__mf_list__"></div>
-            <div class="mf_previewpanel" id="__mf_preview__">
+          <div class="mf_row">
+            <input class="mf_inp" id="__mf_q__" placeholder="${t('search')}" />
+            <select class="mf_sel" id="__mf_filter__" title="Filter by media type">
+              <option value="all">${t('filterAll')}</option>
+              <option value="image">${t('filterImages')}</option>
+              <option value="audio">${t('filterAudio')}</option>
+              <option value="video">${t('filterVideo')}</option>
+              <option value="playlist">${t('filterPlaylists')}</option>
+              <option value="extractor">${t('filterExtractors')}</option>
+              <option value="subs">${t('filterSubs')}</option>
+              <option value="other">${t('filterOther')}</option>
+            </select>
+            <select class="mf_sel" id="__mf_sort__" title="Sort the list">
+              <option value="newest">${t('newest')}</option>
+              <option value="oldest">${t('oldest')}</option>
+              <option value="unique">${t('uniqueFirst')}</option>
+            </select>
+            <select class="mf_sel" id="__mf_lang__" title="UI language">
+              <option value="auto">${t('auto')}</option>
+              <option value="en">English</option>
+              <option value="bg">Български</option>
+            </select>
+            <button class="mf_iconbtn" id="__mf_compact__">${t('compact')}</button>
+            <button class="mf_iconbtn" id="__mf_layout__">${t('viewList')}</button>
+            <button class="mf_iconbtn" id="__mf_toasttoggle__">${t('toast')}: ${t('on')}</button>
+            <button class="mf_iconbtn" id="__mf_clear__">${t('clear')}</button>
+          </div>
+          <div class="mf_customizer" id="__mf_customizer__">
+            <div class="mf_field">
+              <label for="__mf_theme__">${t('theme')}</label>
+              <select class="mf_sel" id="__mf_theme__">
+                <option value="midnight">${t('themeMidnight')}</option>
+                <option value="neon">${t('themeNeon')}</option>
+                <option value="aurora">${t('themeAurora')}</option>
+              </select>
+            </div>
+            <div class="mf_field">
+              <label for="__mf_motion__">${t('motion')}</label>
+              <select class="mf_sel" id="__mf_motion__">
+                <option value="off">${t('motionOff')}</option>
+                <option value="calm">${t('motionCalm')}</option>
+                <option value="full">${t('motionFull')}</option>
+              </select>
+            </div>
+            <div class="mf_field">
+              <label for="__mf_dockside__">${t('dockSide')}</label>
+              <select class="mf_sel" id="__mf_dockside__">
+                <option value="right">${t('dockRight')}</option>
+                <option value="left">${t('dockLeft')}</option>
+              </select>
+            </div>
+            <div class="mf_field">
+              <label for="__mf_panelwidth__">${t('panelWidth')}</label>
+              <select class="mf_sel" id="__mf_panelwidth__">
+                <option value="narrow">${t('widthNarrow')}</option>
+                <option value="normal">${t('widthNormal')}</option>
+                <option value="wide">${t('widthWide')}</option>
+                <option value="ultra">${t('widthUltra')}</option>
+              </select>
+            </div>
+            <div class="mf_field">
+              <label for="__mf_panelheight__">${t('panelHeight')}</label>
+              <select class="mf_sel" id="__mf_panelheight__">
+                <option value="compact">${t('heightCompact')}</option>
+                <option value="normal">${t('heightNormal')}</option>
+                <option value="tall">${t('heightTall')}</option>
+                <option value="full">${t('heightFull')}</option>
+              </select>
             </div>
           </div>
+          <div class="mf_body" id="__mf_body__">
+            <div class="mf_tip" id="__mf_tip__">${t('tip')}</div>
+            <div class="mf_listwrap" id="__mf_list__"></div>
+          </div>
         </div>
+        <aside class="mf_previewdock" id="__mf_previewdock__">
+          <div class="mf_previewdock_hdr">
+            <div class="mf_previewdock_copy">
+              <div class="mf_previewdock_title" id="__mf_previewtitle__">${t('previewPane')}</div>
+              <div class="mf_previewdock_sub" id="__mf_previewsubtitle__">${t('selectPreview')}</div>
+            </div>
+            <button class="mf_iconbtn" id="__mf_previewclose__">${t('close')}</button>
+          </div>
+          <div class="mf_previewdock_body" id="__mf_preview__">
+            <div class="mf_preview_empty">${t('selectPreview')}</div>
+          </div>
+        </aside>
       </div>
     `;
 
@@ -1613,6 +2198,8 @@
 
     ui = {
       root, host, toastWrap, msgEl, btn, backdrop,
+      title: backdrop.querySelector('#__mf_title__'),
+      owner: backdrop.querySelector('#__mf_owner__'),
       sub: backdrop.querySelector('#__mf_sub__'),
       body: backdrop.querySelector('#__mf_body__'),
       q: backdrop.querySelector('#__mf_q__'),
@@ -1625,11 +2212,21 @@
       clear: backdrop.querySelector('#__mf_clear__'),
       copyAllBtn: backdrop.querySelector('#__mf_copyall__'),
       exportBtn: backdrop.querySelector('#__mf_export__'),
+      customizeBtn: backdrop.querySelector('#__mf_customize__'),
+      customizer: backdrop.querySelector('#__mf_customizer__'),
+      theme: backdrop.querySelector('#__mf_theme__'),
+      motion: backdrop.querySelector('#__mf_motion__'),
+      dockSide: backdrop.querySelector('#__mf_dockside__'),
+      panelWidth: backdrop.querySelector('#__mf_panelwidth__'),
+      panelHeight: backdrop.querySelector('#__mf_panelheight__'),
       openListBtn: backdrop.querySelector('#__mf_openlist__'),
       closeBtn: backdrop.querySelector('#__mf_close__'),
-      split: backdrop.querySelector('#__mf_split__'),
       listWrap: backdrop.querySelector('#__mf_list__'),
+      previewDock: backdrop.querySelector('#__mf_previewdock__'),
       previewPane: backdrop.querySelector('#__mf_preview__'),
+      previewTitle: backdrop.querySelector('#__mf_previewtitle__'),
+      previewSubtitle: backdrop.querySelector('#__mf_previewsubtitle__'),
+      previewCloseBtn: backdrop.querySelector('#__mf_previewclose__'),
       tip: backdrop.querySelector('#__mf_tip__')
     };
 
@@ -1640,14 +2237,32 @@
     ui.compact.onclick = () => { state.compact = !state.compact; saveState(); renderList(); };
     ui.layout.onclick = () => { state.layout = state.layout === 'list' ? 'grid' : 'list'; saveState(); renderList(); renderHeader(); };
     ui.toastToggle.onclick = () => { state.toast = !state.toast; saveState(); renderToastState(); };
-    ui.clear.onclick = () => { found.clear(); srcSeen.clear(); tsSeen.clear(); bridgeProbeSeen.clear(); ytSnapshotSig = ''; state.previewUrl = ''; state.previewType = ''; previewState = { url: '', sig: '' }; renderAll(); scanExtractorPages(); };
+    ui.clear.onclick = () => {
+      buildClearBaseline();
+      found.clear();
+      ytSnapshotSig = '';
+      state.previewUrl = '';
+      state.previewType = '';
+      previewState = { url: '', sig: '' };
+      clearPreviewSelection();
+      renderAll();
+    };
     ui.copyAllBtn.onclick = () => copyAll();
     ui.exportBtn.onclick = () => exportTxt();
+    ui.customizeBtn.onclick = () => { state.customizerOpen = !state.customizerOpen; saveState(); renderCustomizerState(); };
+    ui.theme.onchange = () => { state.theme = ui.theme.value || 'midnight'; saveState(); applyAppearance(); };
+    ui.motion.onchange = () => { state.motion = ui.motion.value || 'full'; saveState(); applyAppearance(); };
+    ui.dockSide.onchange = () => { state.dockSide = ui.dockSide.value || 'right'; saveState(); applyAppearance(); };
+    ui.panelWidth.onchange = () => { state.panelWidth = ui.panelWidth.value || 'normal'; saveState(); applyAppearance(); };
+    ui.panelHeight.onchange = () => { state.panelHeight = ui.panelHeight.value || 'normal'; saveState(); applyAppearance(); };
     ui.openListBtn.onclick = () => openList();
     ui.closeBtn.onclick = () => closePanel();
+    ui.previewCloseBtn.onclick = () => { clearPreviewSelection(); renderList(); };
 
     renderToastState();
     applyLauncherVisibility();
+    applyAppearance();
+    renderCustomizerState();
 
     if (!hotkeyHooked) {
       hotkeyHooked = true;
@@ -1679,6 +2294,28 @@
     ensureUI();
     if (!ui?.btn) return;
     ui.btn.classList.toggle('mf_btn_hidden', !state.launcherVisible);
+  }
+
+  function applyAppearance() {
+    ensureUI();
+    if (!ui?.root) return;
+    ui.root.setAttribute('data-theme', state.theme || 'midnight');
+    ui.root.setAttribute('data-motion', state.motion || 'full');
+    ui.root.setAttribute('data-dock-side', state.dockSide || 'right');
+    ui.root.setAttribute('data-panel-width', state.panelWidth || 'normal');
+    ui.root.setAttribute('data-panel-height', state.panelHeight || 'normal');
+  }
+
+  function renderCustomizerState() {
+    ensureUI();
+    if (!ui?.customizer) return;
+    ui.customizer.classList.toggle('mf_open', !!state.customizerOpen);
+    ui.customizeBtn.textContent = state.customizerOpen ? t('customizeHide') : t('customize');
+    ui.theme.value = state.theme || 'midnight';
+    ui.motion.value = state.motion || 'full';
+    ui.dockSide.value = state.dockSide || 'right';
+    ui.panelWidth.value = state.panelWidth || 'normal';
+    ui.panelHeight.value = state.panelHeight || 'normal';
   }
 
   function openPanel() {
@@ -1713,10 +2350,14 @@
     ui.toastWrap.querySelector('.copy').textContent = t('copyAll');
     ui.toastWrap.querySelector('.x').textContent = t('close');
 
+    ui.title.textContent = t('title');
+    ui.owner.title = t('followGithub');
     ui.openListBtn.textContent = t('openList');
     ui.copyAllBtn.textContent = t('copyAll');
     ui.exportBtn.textContent = t('export');
+    ui.customizeBtn.textContent = state.customizerOpen ? t('customizeHide') : t('customize');
     ui.closeBtn.textContent = t('close');
+    ui.previewCloseBtn.textContent = t('close');
 
     ui.q.placeholder = t('search');
 
@@ -1737,7 +2378,32 @@
 
     ui.compact.textContent = t('compact');
     ui.clear.textContent = t('clear');
+    ui.customizer.querySelector('label[for="__mf_theme__"]').textContent = t('theme');
+    ui.customizer.querySelector('label[for="__mf_motion__"]').textContent = t('motion');
+    ui.customizer.querySelector('label[for="__mf_dockside__"]').textContent = t('dockSide');
+    ui.customizer.querySelector('label[for="__mf_panelwidth__"]').textContent = t('panelWidth');
+    ui.customizer.querySelector('label[for="__mf_panelheight__"]').textContent = t('panelHeight');
+    ui.theme.querySelector('option[value="midnight"]').textContent = t('themeMidnight');
+    ui.theme.querySelector('option[value="neon"]').textContent = t('themeNeon');
+    ui.theme.querySelector('option[value="aurora"]').textContent = t('themeAurora');
+    ui.motion.querySelector('option[value="off"]').textContent = t('motionOff');
+    ui.motion.querySelector('option[value="calm"]').textContent = t('motionCalm');
+    ui.motion.querySelector('option[value="full"]').textContent = t('motionFull');
+    ui.dockSide.querySelector('option[value="right"]').textContent = t('dockRight');
+    ui.dockSide.querySelector('option[value="left"]').textContent = t('dockLeft');
+    ui.panelWidth.querySelector('option[value="narrow"]').textContent = t('widthNarrow');
+    ui.panelWidth.querySelector('option[value="normal"]').textContent = t('widthNormal');
+    ui.panelWidth.querySelector('option[value="wide"]').textContent = t('widthWide');
+    ui.panelWidth.querySelector('option[value="ultra"]').textContent = t('widthUltra');
+    ui.panelHeight.querySelector('option[value="compact"]').textContent = t('heightCompact');
+    ui.panelHeight.querySelector('option[value="normal"]').textContent = t('heightNormal');
+    ui.panelHeight.querySelector('option[value="tall"]').textContent = t('heightTall');
+    ui.panelHeight.querySelector('option[value="full"]').textContent = t('heightFull');
+    ui.previewTitle.textContent = t('previewPane');
+    ui.previewSubtitle.textContent = state.previewUrl ? clip(state.previewUrl, 96) : t('selectPreview');
 
+    applyAppearance();
+    renderCustomizerState();
     renderToastState();
     renderAll();
   }
@@ -1807,7 +2473,7 @@
     }
 
     const html = [];
-    for (const it of items.slice(0, CFG.maxItems)) {
+    items.slice(0, CFG.maxItems).forEach((it) => {
       const meta = it.meta || {};
       const badge =
         it.type === 'image' ? t('filterImages') :
@@ -1846,7 +2512,7 @@
           </div>
         </div>
       `);
-    }
+    });
 
     ui.listWrap.innerHTML = html.join('');
 
@@ -1872,15 +2538,17 @@
     try {
       ensureUI();
       const pane = ui?.previewPane;
-      const split = ui?.split;
-      if (!pane || !split) return;
+      const dock = ui?.previewDock;
+      if (!pane || !dock) return;
 
       const url = state.previewUrl || '';
       if (!url) {
         stopMedia(pane);
         previewState = { url: '', sig: '' };
-        pane.innerHTML = '';
-        split.classList.add('mf_no_preview');
+        pane.innerHTML = `<div class="mf_preview_empty">${escapeHtml(t('selectPreview'))}</div>`;
+        dock.classList.remove('mf_open');
+        if (ui.previewTitle) ui.previewTitle.textContent = t('previewPane');
+        if (ui.previewSubtitle) ui.previewSubtitle.textContent = t('selectPreview');
         return;
       }
 
@@ -1896,7 +2564,9 @@
       const note = meta.note || t('unknown');
       const from = meta.from && meta.from.size ? Array.from(meta.from).join(', ') : '';
 
-      split.classList.remove('mf_no_preview');
+      dock.classList.add('mf_open');
+      if (ui.previewTitle) ui.previewTitle.textContent = t('previewPane');
+      if (ui.previewSubtitle) ui.previewSubtitle.textContent = clip(url, 96);
 
       pane.innerHTML = `
         <div class="mf_preview_card">
@@ -1921,7 +2591,7 @@
           slot.appendChild(media);
           primeMediaForPreview(media, url);
         }
-        else slot.innerHTML = `<div class="mf_preview_empty">Preview not available</div>`;
+        else slot.innerHTML = `<div class="mf_preview_empty">${escapeHtml(t('previewUnavailable'))}</div>`;
       }
 
       previewState = { url, sig };
@@ -1933,6 +2603,10 @@
     state.previewUrl = '';
     state.previewType = '';
     previewState = { url: '', sig: '' };
+    if (ui?.previewDock) ui.previewDock.classList.remove('mf_open');
+    if (ui?.previewPane) ui.previewPane.innerHTML = `<div class="mf_preview_empty">${escapeHtml(t('selectPreview'))}</div>`;
+    if (ui?.previewTitle) ui.previewTitle.textContent = t('previewPane');
+    if (ui?.previewSubtitle) ui.previewSubtitle.textContent = t('selectPreview');
   }
 
   function renderHeader() {
@@ -1942,7 +2616,9 @@
     const pCnt = players.size;
 
     const sub = `${t('found')}: ${cnt} ${t('links')} • ${t('players')}: ${pCnt}`;
+    ui.title.textContent = t('title');
     ui.sub.textContent = sub;
+    if (ui.owner) ui.owner.title = t('followGithub');
 
     ui.btn.querySelector('.mf_cnt').textContent = `${t('title')} • ${cnt}`;
     if (ui.msgEl) ui.msgEl.textContent = sub;
@@ -1951,18 +2627,26 @@
     ui.sort.value = state.sort;
     ui.lang.value = state.lang;
     ui.q.value = state.query || '';
+    ui.theme.value = state.theme || 'midnight';
+    ui.motion.value = state.motion || 'full';
+    ui.dockSide.value = state.dockSide || 'right';
+    ui.panelWidth.value = state.panelWidth || 'normal';
+    ui.panelHeight.value = state.panelHeight || 'normal';
     if (ui.layout) {
       ui.layout.textContent = `${t('layout')}: ${state.layout === 'grid' ? t('viewGrid') : t('viewList')}`;
       ui.layout.title = 'Switch between list and grid layouts';
     }
+    renderCustomizerState();
     renderToastState();
     applyLauncherVisibility();
+    applyAppearance();
     ui.btn.classList.toggle('mf_open', uiOpen);
     const arrow = ui.btn.querySelector('.mf_toggle');
     if (arrow) {
       arrow.textContent = state.launcherVisible ? '>' : '<';
       arrow.title = state.launcherVisible ? t('launcherHide') : t('launcherShow');
     }
+    if (!state.previewUrl && ui.previewSubtitle) ui.previewSubtitle.textContent = t('selectPreview');
   }
 
   function renderAll() {
@@ -2099,18 +2783,11 @@
   function focusPreviewPane() {
     try {
       ensureUI();
-      const pane = ui?.previewPane;
-      const body = ui?.body;
-      if (!pane || !body || !state.previewUrl) return;
-      pane.classList.add('mf_peek');
-      setTimeout(() => { try { pane.classList.remove('mf_peek'); } catch { } }, 800);
-      pane.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
-
-      const top = pane.offsetTop - 10;
-      const cur = body.scrollTop;
-      if (top < cur || top > cur + body.clientHeight - 120) {
-        body.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
-      }
+      const dock = ui?.previewDock;
+      if (!dock || !state.previewUrl) return;
+      dock.classList.add('mf_peek');
+      setTimeout(() => { try { dock.classList.remove('mf_peek'); } catch { } }, 800);
+      dock.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
     } catch { }
   }
 
@@ -2239,13 +2916,13 @@
     return `<!doctype html><html><head><meta charset="utf-8">
       <title>${escapeHtml(t('title'))}</title>
       <style>
-        body{background:#020617;color:#e5e7eb;font:13px system-ui,-apple-system,"Segoe UI",sans-serif;padding:12px;}
-        a{color:#7dd3fc;word-break:break-all;text-decoration:none;}
+        body{background:linear-gradient(180deg,#14091f,#090612);color:#f5ebff;font:13px system-ui,-apple-system,"Segoe UI",sans-serif;padding:12px;}
+        a{color:#e9d5ff;word-break:break-all;text-decoration:none;}
         table{width:100%;border-collapse:collapse;margin-top:10px;}
-        th,td{border:1px solid rgba(148,163,184,.22);padding:8px;vertical-align:top;}
-        th{background:#0b1220;text-align:left;}
-        .b{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid rgba(148,163,184,.3);background:#0b1220;font-weight:600;font-size:12px;}
-        .tip{opacity:.75;margin-top:6px;}
+        th,td{border:1px solid rgba(216,180,254,.2);padding:8px;vertical-align:top;}
+        th{background:#241037;text-align:left;}
+        .b{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid rgba(216,180,254,.26);background:#341455;font-weight:600;font-size:12px;}
+        .tip{opacity:.78;margin-top:6px;}
       </style>
     </head><body>
       <h1 style="margin:0 0 6px 0;font-size:18px;">${escapeHtml(t('title'))}</h1>
@@ -2253,7 +2930,7 @@
       <div style="opacity:.8;margin-top:8px;">${escapeHtml(t('found'))}: ${found.size} • ${escapeHtml(t('players'))}: ${players.size}</div>
       <table>
         <thead><tr>
-          <th>Type</th><th>URL</th><th>MIME</th><th>Size</th><th>Note</th><th>From</th>
+          <th>${escapeHtml(t('listType'))}</th><th>${escapeHtml(t('listUrl'))}</th><th>${escapeHtml(t('listMime'))}</th><th>${escapeHtml(t('listSize'))}</th><th>${escapeHtml(t('listNote'))}</th><th>${escapeHtml(t('listFrom'))}</th>
         </tr></thead>
         <tbody>${rows || `<tr><td colspan="6">${escapeHtml(t('noneYet'))}</td></tr>`}</tbody>
       </table>
