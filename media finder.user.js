@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.7.1
+// @version      1.7.2
 // @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing, extractor-page detection, and richer download UX
 // @match        *://*/*
 // @noframes
@@ -203,6 +203,16 @@
       dockSide: 'Dock',
       dockRight: 'Right',
       dockLeft: 'Left',
+      launcherPosition: 'Toggle position',
+      positionTopLeft: 'Top left',
+      positionTop: 'Top',
+      positionTopRight: 'Top right',
+      positionCenterLeft: 'Center left',
+      positionCenter: 'Center',
+      positionCenterRight: 'Center right',
+      positionBottomLeft: 'Bottom left',
+      positionBottom: 'Bottom',
+      positionBottomRight: 'Bottom right',
       panelWidth: 'Width',
       widthNarrow: 'Narrow',
       widthNormal: 'Normal',
@@ -297,6 +307,16 @@
       dockSide: 'Панел',
       dockRight: 'Вдясно',
       dockLeft: 'Вляво',
+      launcherPosition: 'Позиция на бутона',
+      positionTopLeft: 'Горе вляво',
+      positionTop: 'Горе',
+      positionTopRight: 'Горе вдясно',
+      positionCenterLeft: 'Център вляво',
+      positionCenter: 'Център',
+      positionCenterRight: 'Център вдясно',
+      positionBottomLeft: 'Долу вляво',
+      positionBottom: 'Долу',
+      positionBottomRight: 'Долу вдясно',
       panelWidth: 'Ширина',
       widthNarrow: 'Тясна',
       widthNormal: 'Нормална',
@@ -334,6 +354,7 @@
     theme: 'midnight',
     motion: 'full',
     dockSide: 'right',
+    launcherPosition: 'bottom-right',
     panelWidth: 'normal',
     panelHeight: 'normal',
     previewUrl: '',
@@ -384,6 +405,7 @@
     const okTheme = new Set(['midnight', 'neon', 'aurora']);
     const okMotion = new Set(['off', 'calm', 'full']);
     const okDockSide = new Set(['right', 'left']);
+    const okLauncherPosition = new Set(['top-left', 'top', 'top-right', 'center-left', 'center', 'center-right', 'bottom-left', 'bottom', 'bottom-right']);
     const okPanelWidth = new Set(['narrow', 'normal', 'wide', 'ultra']);
     const okPanelHeight = new Set(['compact', 'normal', 'tall', 'full']);
 
@@ -404,6 +426,7 @@
     if (okTheme.has(saved.theme)) state.theme = saved.theme;
     if (okMotion.has(saved.motion)) state.motion = saved.motion;
     if (okDockSide.has(saved.dockSide)) state.dockSide = saved.dockSide;
+    if (okLauncherPosition.has(saved.launcherPosition)) state.launcherPosition = saved.launcherPosition;
     if (okPanelWidth.has(saved.panelWidth)) state.panelWidth = saved.panelWidth;
     if (okPanelHeight.has(saved.panelHeight)) state.panelHeight = saved.panelHeight;
   }
@@ -428,6 +451,7 @@
         theme: state.theme,
         motion: state.motion,
         dockSide: state.dockSide,
+        launcherPosition: state.launcherPosition,
         panelWidth: state.panelWidth,
         panelHeight: state.panelHeight
       };
@@ -1695,8 +1719,29 @@
         backdrop-filter: blur(14px);
         transition: transform var(--mf-dur-med) var(--mf-ease), box-shadow var(--mf-dur-med) var(--mf-ease), opacity var(--mf-dur-fast) linear;
       }
+      :host([data-launcher-position="top-left"]) .mf_btn { left: 12px; right: auto; top: 12px; bottom: auto; }
+      :host([data-launcher-position="top"]) .mf_btn { left: 50%; right: auto; top: 12px; bottom: auto; transform: translateX(-50%); }
+      :host([data-launcher-position="top-right"]) .mf_btn { left: auto; right: 12px; top: 12px; bottom: auto; }
+      :host([data-launcher-position="center-left"]) .mf_btn { left: 12px; right: auto; top: 50%; bottom: auto; transform: translateY(-50%); }
+      :host([data-launcher-position="center"]) .mf_btn { left: 50%; right: auto; top: 50%; bottom: auto; transform: translate(-50%, -50%); }
+      :host([data-launcher-position="center-right"]) .mf_btn { left: auto; right: 12px; top: 50%; bottom: auto; transform: translateY(-50%); }
+      :host([data-launcher-position="bottom-left"]) .mf_btn { left: 12px; right: auto; top: auto; bottom: 12px; }
+      :host([data-launcher-position="bottom"]) .mf_btn { left: 50%; right: auto; top: auto; bottom: 12px; transform: translateX(-50%); }
+      :host([data-launcher-position="bottom-right"]) .mf_btn { left: auto; right: 12px; top: auto; bottom: 12px; }
       .mf_btn:hover { transform: translateY(-2px); box-shadow: 0 22px 52px rgba(6,2,14,.56); }
-      .mf_btn.mf_btn_hidden { transform: translateX(85%) translateY(0); opacity:.35; pointer-events:auto; }
+      :host([data-launcher-position="top"]) .mf_btn:hover,
+      :host([data-launcher-position="bottom"]) .mf_btn:hover { transform: translateX(-50%) translateY(-2px); }
+      :host([data-launcher-position="center-left"]) .mf_btn:hover,
+      :host([data-launcher-position="center-right"]) .mf_btn:hover { transform: translateY(calc(-50% - 2px)); }
+      :host([data-launcher-position="center"]) .mf_btn:hover { transform: translate(-50%, calc(-50% - 2px)); }
+      .mf_btn.mf_btn_hidden { opacity:.35; pointer-events:auto; }
+      :host([data-launcher-position$="-left"]) .mf_btn.mf_btn_hidden,
+      :host([data-launcher-position="center-left"]) .mf_btn.mf_btn_hidden { transform: translateX(-85%); }
+      :host([data-launcher-position$="-right"]) .mf_btn.mf_btn_hidden,
+      :host([data-launcher-position="center-right"]) .mf_btn.mf_btn_hidden { transform: translateX(85%); }
+      :host([data-launcher-position="top"]) .mf_btn.mf_btn_hidden { transform: translate(-50%, -85%); }
+      :host([data-launcher-position="bottom"]) .mf_btn.mf_btn_hidden { transform: translate(-50%, 85%); }
+      :host([data-launcher-position="center"]) .mf_btn.mf_btn_hidden { transform: translate(-50%, -50%) scale(.92); }
       .mf_btn .mf_toggle {
         width: 20px; height: 20px; border-radius: 999px;
         border: 1px solid var(--mf-border-strong);
@@ -2121,6 +2166,20 @@
               </select>
             </div>
             <div class="mf_field">
+              <label for="__mf_launcherposition__">${t('launcherPosition')}</label>
+              <select class="mf_sel" id="__mf_launcherposition__">
+                <option value="top-left">${t('positionTopLeft')}</option>
+                <option value="top">${t('positionTop')}</option>
+                <option value="top-right">${t('positionTopRight')}</option>
+                <option value="center-left">${t('positionCenterLeft')}</option>
+                <option value="center">${t('positionCenter')}</option>
+                <option value="center-right">${t('positionCenterRight')}</option>
+                <option value="bottom-left">${t('positionBottomLeft')}</option>
+                <option value="bottom">${t('positionBottom')}</option>
+                <option value="bottom-right">${t('positionBottomRight')}</option>
+              </select>
+            </div>
+            <div class="mf_field">
               <label for="__mf_panelwidth__">${t('panelWidth')}</label>
               <select class="mf_sel" id="__mf_panelwidth__">
                 <option value="narrow">${t('widthNarrow')}</option>
@@ -2221,6 +2280,7 @@
       theme: backdrop.querySelector('#__mf_theme__'),
       motion: backdrop.querySelector('#__mf_motion__'),
       dockSide: backdrop.querySelector('#__mf_dockside__'),
+      launcherPosition: backdrop.querySelector('#__mf_launcherposition__'),
       panelWidth: backdrop.querySelector('#__mf_panelwidth__'),
       panelHeight: backdrop.querySelector('#__mf_panelheight__'),
       openListBtn: backdrop.querySelector('#__mf_openlist__'),
@@ -2257,6 +2317,7 @@
     ui.theme.onchange = () => { state.theme = ui.theme.value || 'midnight'; saveState(); applyAppearance(); };
     ui.motion.onchange = () => { state.motion = ui.motion.value || 'full'; saveState(); applyAppearance(); };
     ui.dockSide.onchange = () => { state.dockSide = ui.dockSide.value || 'right'; saveState(); applyAppearance(); };
+    ui.launcherPosition.onchange = () => { state.launcherPosition = ui.launcherPosition.value || 'bottom-right'; saveState(); applyAppearance(); };
     ui.panelWidth.onchange = () => { state.panelWidth = ui.panelWidth.value || 'normal'; saveState(); applyAppearance(); };
     ui.panelHeight.onchange = () => { state.panelHeight = ui.panelHeight.value || 'normal'; saveState(); applyAppearance(); };
     ui.openListBtn.onclick = () => openList();
@@ -2306,6 +2367,7 @@
     ui.root.setAttribute('data-theme', state.theme || 'midnight');
     ui.root.setAttribute('data-motion', state.motion || 'full');
     ui.root.setAttribute('data-dock-side', state.dockSide || 'right');
+    ui.root.setAttribute('data-launcher-position', state.launcherPosition || 'bottom-right');
     ui.root.setAttribute('data-panel-width', state.panelWidth || 'normal');
     ui.root.setAttribute('data-panel-height', state.panelHeight || 'normal');
   }
@@ -2318,6 +2380,7 @@
     ui.theme.value = state.theme || 'midnight';
     ui.motion.value = state.motion || 'full';
     ui.dockSide.value = state.dockSide || 'right';
+    ui.launcherPosition.value = state.launcherPosition || 'bottom-right';
     ui.panelWidth.value = state.panelWidth || 'normal';
     ui.panelHeight.value = state.panelHeight || 'normal';
   }
@@ -2385,6 +2448,7 @@
     ui.customizer.querySelector('label[for="__mf_theme__"]').textContent = t('theme');
     ui.customizer.querySelector('label[for="__mf_motion__"]').textContent = t('motion');
     ui.customizer.querySelector('label[for="__mf_dockside__"]').textContent = t('dockSide');
+    ui.customizer.querySelector('label[for="__mf_launcherposition__"]').textContent = t('launcherPosition');
     ui.customizer.querySelector('label[for="__mf_panelwidth__"]').textContent = t('panelWidth');
     ui.customizer.querySelector('label[for="__mf_panelheight__"]').textContent = t('panelHeight');
     ui.theme.querySelector('option[value="midnight"]').textContent = t('themeMidnight');
@@ -2395,6 +2459,15 @@
     ui.motion.querySelector('option[value="full"]').textContent = t('motionFull');
     ui.dockSide.querySelector('option[value="right"]').textContent = t('dockRight');
     ui.dockSide.querySelector('option[value="left"]').textContent = t('dockLeft');
+    ui.launcherPosition.querySelector('option[value="top-left"]').textContent = t('positionTopLeft');
+    ui.launcherPosition.querySelector('option[value="top"]').textContent = t('positionTop');
+    ui.launcherPosition.querySelector('option[value="top-right"]').textContent = t('positionTopRight');
+    ui.launcherPosition.querySelector('option[value="center-left"]').textContent = t('positionCenterLeft');
+    ui.launcherPosition.querySelector('option[value="center"]').textContent = t('positionCenter');
+    ui.launcherPosition.querySelector('option[value="center-right"]').textContent = t('positionCenterRight');
+    ui.launcherPosition.querySelector('option[value="bottom-left"]').textContent = t('positionBottomLeft');
+    ui.launcherPosition.querySelector('option[value="bottom"]').textContent = t('positionBottom');
+    ui.launcherPosition.querySelector('option[value="bottom-right"]').textContent = t('positionBottomRight');
     ui.panelWidth.querySelector('option[value="narrow"]').textContent = t('widthNarrow');
     ui.panelWidth.querySelector('option[value="normal"]').textContent = t('widthNormal');
     ui.panelWidth.querySelector('option[value="wide"]').textContent = t('widthWide');
