@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.7.0
+// @version      1.7.1
 // @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing, extractor-page detection, and richer download UX
 // @match        *://*/*
 // @noframes
@@ -1501,6 +1501,8 @@
 
     const root = document.createElement('div');
     root.id = '__mf_root__';
+    root.style.webkitUserSelect = 'none';
+    root.style.userSelect = 'none';
     root.attachShadow?.({ mode: 'open' });
 
     const host = root.shadowRoot || root;
@@ -1662,6 +1664,8 @@
         --mf-preview-height: calc(100dvh - 24px);
       }
       :host, * { box-sizing: border-box; }
+      :host, :host * { -webkit-user-select: none !important; user-select: none !important; }
+      input, textarea, [contenteditable="true"] { -webkit-user-select: text !important; user-select: text !important; }
       @keyframes mfRise {
         from { opacity: 0; transform: translateY(var(--mf-float-y)) scale(.985); }
         to { opacity: 1; transform: translateY(0) scale(1); }
