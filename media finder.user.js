@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.7.2
+// @version      1.8.0
 // @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing, extractor-page detection, and richer download UX
 // @match        *://*/*
 // @noframes
@@ -2038,6 +2038,152 @@
         background: #0e0917;
       }
       .mf_preview_empty { font: 12px system-ui,-apple-system,"Segoe UI",sans-serif; color: var(--mf-text-soft); }
+
+      /* v1.8.0 midnight-purple rounded-rectangle UI */
+      :host {
+        --mf-bg: rgba(8, 5, 15, .98);
+        --mf-bg-strong: rgba(13, 8, 24, .99);
+        --mf-surface: rgba(35, 20, 59, .48);
+        --mf-surface-strong: rgba(28, 16, 48, .94);
+        --mf-surface-soft: rgba(112, 72, 173, .14);
+        --mf-border: rgba(173, 146, 224, .20);
+        --mf-border-strong: rgba(180, 145, 255, .44);
+        --mf-text: #f4efff;
+        --mf-text-soft: rgba(226, 216, 245, .72);
+        --mf-accent: #b58cff;
+        --mf-accent-strong: #8f5cff;
+        --mf-link: #d8c2ff;
+        --mf-shadow: 0 24px 64px rgba(2, 1, 8, .66);
+        --mf-glow: 0 0 0 1px rgba(181,140,255,.16), 0 18px 42px rgba(4,2,12,.46);
+        --mf-backdrop: rgba(4, 2, 9, .70);
+        --mf-launcher-grad-a: rgba(143,92,255,.12);
+        --mf-launcher-top: rgba(24,14,42,.985);
+        --mf-launcher-bottom: rgba(11,7,20,.995);
+        --mf-panel-top: rgba(18,11,32,.995);
+        --mf-panel-bottom: rgba(9,6,17,.995);
+        --mf-dock-top: rgba(20,12,35,.99);
+        --mf-dock-bottom: rgba(9,6,17,.995);
+        --mf-card-top: rgba(27,16,46,.90);
+        --mf-card-bottom: rgba(16,10,29,.94);
+        --mf-control-bg: rgba(38,22,64,.88);
+        --mf-control-bg-soft: rgba(24,15,41,.92);
+        --mf-brand-bg: rgba(45,26,75,.92);
+        --mf-badge-bg: rgba(52,30,86,.88);
+        --mf-preview-player-top: rgba(14,9,25,.99);
+        --mf-preview-player-bottom: rgba(7,5,13,1);
+        --mf-radius-panel: 10px;
+        --mf-radius-control: 7px;
+        --mf-radius-small: 5px;
+      }
+      .mf_panel,
+      .mf_previewdock {
+        border-radius: var(--mf-radius-panel) !important;
+        border-color: var(--mf-border-strong);
+        background: linear-gradient(180deg, var(--mf-panel-top), var(--mf-panel-bottom));
+      }
+      .mf_previewdock {
+        background: linear-gradient(180deg, var(--mf-dock-top), var(--mf-dock-bottom));
+      }
+      .mf_hdr {
+        padding: 12px;
+        gap: 8px;
+        flex-wrap: wrap;
+        border-bottom: 1px solid var(--mf-border);
+        background: rgba(12,8,22,.72);
+      }
+      .mf_hdrmain { margin-right: 4px; }
+      .mf_sp { min-width: 12px; }
+      .mf_brandlink,
+      .mf_iconbtn,
+      .mf_inp,
+      .mf_sel,
+      .mf_toast > div,
+      .mf_toast button,
+      .mf_item,
+      .mf_preview_player,
+      .mf_preview_player video,
+      .mf_preview_player audio,
+      .mf_preview_player img {
+        border-radius: var(--mf-radius-control) !important;
+      }
+      .mf_btn {
+        border-radius: var(--mf-radius-control) !important;
+        background: linear-gradient(180deg, var(--mf-launcher-top), var(--mf-launcher-bottom));
+        box-shadow: 0 16px 36px rgba(3,1,9,.52);
+      }
+      .mf_btn .mf_toggle {
+        border-radius: var(--mf-radius-small) !important;
+        background: rgba(48,28,80,.92);
+      }
+      .mf_dot {
+        border-radius: 2px !important;
+      }
+      .mf_row {
+        padding: 9px 12px;
+        gap: 8px;
+        border-bottom: 1px solid var(--mf-border);
+        background: rgba(8,5,15,.54);
+      }
+      .mf_iconbtn {
+        min-height: 34px;
+        padding: 8px 10px;
+        background: var(--mf-control-bg);
+      }
+      .mf_iconbtn:hover {
+        background: rgba(55,31,91,.96);
+        border-color: var(--mf-border-strong);
+        box-shadow: 0 8px 20px rgba(4,2,12,.28);
+      }
+      .mf_customizer {
+        margin: 10px 12px 0;
+        padding: 10px;
+        border-radius: var(--mf-radius-panel) !important;
+        border: 1px solid var(--mf-border);
+        background: rgba(13,8,24,.90);
+        grid-template-columns: repeat(auto-fit,minmax(160px,1fr));
+        gap: 8px;
+      }
+      .mf_field {
+        padding: 8px;
+        border: 1px solid rgba(173,146,224,.12);
+        border-radius: var(--mf-radius-control);
+        background: rgba(31,18,52,.44);
+      }
+      .mf_body {
+        gap: 4px;
+        scrollbar-color: rgba(181,140,255,.42) transparent;
+      }
+      .mf_item {
+        margin: 7px 0;
+        border-color: rgba(173,146,224,.16);
+        background: linear-gradient(180deg,var(--mf-card-top),var(--mf-card-bottom));
+      }
+      .mf_item:hover {
+        transform: translateY(-1px);
+        border-color: var(--mf-border-strong);
+        box-shadow: var(--mf-glow);
+      }
+      .mf_badge,
+      .mf_actions button {
+        border-radius: var(--mf-radius-small) !important;
+      }
+      .mf_badge {
+        background: var(--mf-badge-bg);
+        border-color: rgba(173,146,224,.22);
+      }
+      .mf_actions button {
+        background: var(--mf-control-bg);
+        border-color: var(--mf-border);
+      }
+      .mf_inp:focus,
+      .mf_sel:focus {
+        box-shadow: 0 0 0 3px rgba(181,140,255,.13);
+      }
+      .mf_preview_player { border-color: var(--mf-border); }
+      .mf_preview_player video,
+      .mf_preview_player audio,
+      .mf_preview_player img { background: #08050f; }
+
       @media (max-width: 1180px) {
         .mf_stage { gap: 12px; }
         .mf_panel { max-width: none; }
@@ -2059,7 +2205,7 @@
         .mf_iconbtn, .mf_sel { min-height: 42px; }
       }
       @media (max-width: 640px) {
-        .mf_btn { left: 10px; right: 10px; bottom: 10px; justify-content:center; }
+        .mf_btn { max-width: calc(100vw - 20px); justify-content:center; }
         .mf_toast { top: 8px; max-width: calc(100vw - 12px); }
         .mf_toast > div { flex-wrap: wrap; }
         .mf_backdrop { padding: 6px; }
