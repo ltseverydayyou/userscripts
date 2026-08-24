@@ -1,0 +1,113 @@
+name: Apply Media Finder launcher position patch
+
+on:
+  push:
+    paths:
+      - '.github/workflows/media-finder-launcher-position.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Patch Media Finder
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path('media finder.user.js')
+          text = p.read_text(encoding='utf-8')
+
+          def replace_once(old, new):
+              global text
+              if old not in text:
+                  raise SystemExit('Missing expected text:\n' + old[:240])
+              text = text.replace(old, new, 1)
+
+          replace_once('// @version      1.7.1', '// @version      1.7.2')
+          replace_once("      dockSide: 'Dock',\n      dockRight: 'Right',\n      dockLeft: 'Left',", "      dockSide: 'Dock',\n      dockRight: 'Right',\n      dockLeft: 'Left',\n      launcherPosition: 'Toggle position',\n      positionTopLeft: 'Top left',\n      positionTop: 'Top',\n      positionTopRight: 'Top right',\n      positionCenterLeft: 'Center left',\n      positionCenter: 'Center',\n      positionCenterRight: 'Center right',\n      positionBottomLeft: 'Bottom left',\n      positionBottom: 'Bottom',\n      positionBottomRight: 'Bottom right',")
+          replace_once("      dockSide: 'Панел',\n      dockRight: 'Вдясно',\n      dockLeft: 'Вляво',", "      dockSide: 'Панел',\n      dockRight: 'Вдясно',\n      dockLeft: 'Вляво',\n      launcherPosition: 'Позиция на бутона',\n      positionTopLeft: 'Горе вляво',\n      positionTop: 'Горе',\n      positionTopRight: 'Горе вдясно',\n      positionCenterLeft: 'Център вляво',\n      positionCenter: 'Център',\n      positionCenterRight: 'Център вдясно',\n      positionBottomLeft: 'Долу вляво',\n      positionBottom: 'Долу',\n      positionBottomRight: 'Долу вдясно',")
+          replace_once("    dockSide: 'right',\n    panelWidth: 'normal',", "    dockSide: 'right',\n    launcherPosition: 'bottom-right',\n    panelWidth: 'normal',")
+          replace_once("    const okDockSide = new Set(['right', 'left']);\n    const okPanelWidth", "    const okDockSide = new Set(['right', 'left']);\n    const okLauncherPosition = new Set(['top-left', 'top', 'top-right', 'center-left', 'center', 'center-right', 'bottom-left', 'bottom', 'bottom-right']);\n    const okPanelWidth")
+          replace_once("    if (okDockSide.has(saved.dockSide)) state.dockSide = saved.dockSide;\n    if (okPanelWidth", "    if (okDockSide.has(saved.dockSide)) state.dockSide = saved.dockSide;\n    if (okLauncherPosition.has(saved.launcherPosition)) state.launcherPosition = saved.launcherPosition;\n    if (okPanelWidth")
+          replace_once("        dockSide: state.dockSide,\n        panelWidth", "        dockSide: state.dockSide,\n        launcherPosition: state.launcherPosition,\n        panelWidth")
+
+          replace_once("""        transition: transform var(--mf-dur-med) var(--mf-ease), box-shadow var(--mf-dur-med) var(--mf-ease), opacity var(--mf-dur-fast) linear;
+      }
+      .mf_btn:hover""", """        transition: transform var(--mf-dur-med) var(--mf-ease), box-shadow var(--mf-dur-med) var(--mf-ease), opacity var(--mf-dur-fast) linear;
+      }
+      :host([data-launcher-position=\"top-left\"]) .mf_btn { left: 12px; right: auto; top: 12px; bottom: auto; }
+      :host([data-launcher-position=\"top\"]) .mf_btn { left: 50%; right: auto; top: 12px; bottom: auto; transform: translateX(-50%); }
+      :host([data-launcher-position=\"top-right\"]) .mf_btn { left: auto; right: 12px; top: 12px; bottom: auto; }
+      :host([data-launcher-position=\"center-left\"]) .mf_btn { left: 12px; right: auto; top: 50%; bottom: auto; transform: translateY(-50%); }
+      :host([data-launcher-position=\"center\"]) .mf_btn { left: 50%; right: auto; top: 50%; bottom: auto; transform: translate(-50%, -50%); }
+      :host([data-launcher-position=\"center-right\"]) .mf_btn { left: auto; right: 12px; top: 50%; bottom: auto; transform: translateY(-50%); }
+      :host([data-launcher-position=\"bottom-left\"]) .mf_btn { left: 12px; right: auto; top: auto; bottom: 12px; }
+      :host([data-launcher-position=\"bottom\"]) .mf_btn { left: 50%; right: auto; top: auto; bottom: 12px; transform: translateX(-50%); }
+      :host([data-launcher-position=\"bottom-right\"]) .mf_btn { left: auto; right: 12px; top: auto; bottom: 12px; }
+      .mf_btn:hover""")
+          replace_once("""      .mf_btn:hover { transform: translateY(-2px); box-shadow: 0 22px 52px rgba(6,2,14,.56); }
+      .mf_btn.mf_btn_hidden { transform: translateX(85%) translateY(0); opacity:.35; pointer-events:auto; }""", """      .mf_btn:hover { transform: translateY(-2px); box-shadow: 0 22px 52px rgba(6,2,14,.56); }
+      :host([data-launcher-position=\"top\"]) .mf_btn:hover,
+      :host([data-launcher-position=\"bottom\"]) .mf_btn:hover { transform: translateX(-50%) translateY(-2px); }
+      :host([data-launcher-position=\"center-left\"]) .mf_btn:hover,
+      :host([data-launcher-position=\"center-right\"]) .mf_btn:hover { transform: translateY(calc(-50% - 2px)); }
+      :host([data-launcher-position=\"center\"]) .mf_btn:hover { transform: translate(-50%, calc(-50% - 2px)); }
+      .mf_btn.mf_btn_hidden { opacity:.35; pointer-events:auto; }
+      :host([data-launcher-position$=\"-left\"]) .mf_btn.mf_btn_hidden,
+      :host([data-launcher-position=\"center-left\"]) .mf_btn.mf_btn_hidden { transform: translateX(-85%); }
+      :host([data-launcher-position$=\"-right\"]) .mf_btn.mf_btn_hidden,
+      :host([data-launcher-position=\"center-right\"]) .mf_btn.mf_btn_hidden { transform: translateX(85%); }
+      :host([data-launcher-position=\"top\"]) .mf_btn.mf_btn_hidden { transform: translate(-50%, -85%); }
+      :host([data-launcher-position=\"bottom\"]) .mf_btn.mf_btn_hidden { transform: translate(-50%, 85%); }
+      :host([data-launcher-position=\"center\"]) .mf_btn.mf_btn_hidden { transform: translate(-50%, -50%) scale(.92); }""")
+
+          replace_once("""            <div class=\"mf_field\">
+              <label for=\"__mf_panelwidth__\">${t('panelWidth')}</label>""", """            <div class=\"mf_field\">
+              <label for=\"__mf_launcherposition__\">${t('launcherPosition')}</label>
+              <select class=\"mf_sel\" id=\"__mf_launcherposition__\">
+                <option value=\"top-left\">${t('positionTopLeft')}</option>
+                <option value=\"top\">${t('positionTop')}</option>
+                <option value=\"top-right\">${t('positionTopRight')}</option>
+                <option value=\"center-left\">${t('positionCenterLeft')}</option>
+                <option value=\"center\">${t('positionCenter')}</option>
+                <option value=\"center-right\">${t('positionCenterRight')}</option>
+                <option value=\"bottom-left\">${t('positionBottomLeft')}</option>
+                <option value=\"bottom\">${t('positionBottom')}</option>
+                <option value=\"bottom-right\">${t('positionBottomRight')}</option>
+              </select>
+            </div>
+            <div class=\"mf_field\">
+              <label for=\"__mf_panelwidth__\">${t('panelWidth')}</label>""")
+          replace_once("      dockSide: backdrop.querySelector('#__mf_dockside__'),\n      panelWidth:", "      dockSide: backdrop.querySelector('#__mf_dockside__'),\n      launcherPosition: backdrop.querySelector('#__mf_launcherposition__'),\n      panelWidth:")
+          replace_once("    ui.dockSide.onchange = () => { state.dockSide = ui.dockSide.value || 'right'; saveState(); applyAppearance(); };\n    ui.panelWidth", "    ui.dockSide.onchange = () => { state.dockSide = ui.dockSide.value || 'right'; saveState(); applyAppearance(); };\n    ui.launcherPosition.onchange = () => { state.launcherPosition = ui.launcherPosition.value || 'bottom-right'; saveState(); applyAppearance(); };\n    ui.panelWidth")
+          replace_once("    ui.root.setAttribute('data-dock-side', state.dockSide || 'right');\n    ui.root.setAttribute('data-panel-width'", "    ui.root.setAttribute('data-dock-side', state.dockSide || 'right');\n    ui.root.setAttribute('data-launcher-position', state.launcherPosition || 'bottom-right');\n    ui.root.setAttribute('data-panel-width'")
+          replace_once("    ui.dockSide.value = state.dockSide || 'right';\n    ui.panelWidth.value", "    ui.dockSide.value = state.dockSide || 'right';\n    ui.launcherPosition.value = state.launcherPosition || 'bottom-right';\n    ui.panelWidth.value")
+          replace_once("    ui.customizer.querySelector('label[for=\"__mf_dockside__\"]').textContent = t('dockSide');\n    ui.customizer.querySelector('label[for=\"__mf_panelwidth__\"]')", "    ui.customizer.querySelector('label[for=\"__mf_dockside__\"]').textContent = t('dockSide');\n    ui.customizer.querySelector('label[for=\"__mf_launcherposition__\"]').textContent = t('launcherPosition');\n    ui.customizer.querySelector('label[for=\"__mf_panelwidth__\"]')")
+          replace_once("    ui.dockSide.querySelector('option[value=\"left\"]').textContent = t('dockLeft');\n    ui.panelWidth.querySelector", "    ui.dockSide.querySelector('option[value=\"left\"]').textContent = t('dockLeft');\n    ui.launcherPosition.querySelector('option[value=\"top-left\"]').textContent = t('positionTopLeft');\n    ui.launcherPosition.querySelector('option[value=\"top\"]').textContent = t('positionTop');\n    ui.launcherPosition.querySelector('option[value=\"top-right\"]').textContent = t('positionTopRight');\n    ui.launcherPosition.querySelector('option[value=\"center-left\"]').textContent = t('positionCenterLeft');\n    ui.launcherPosition.querySelector('option[value=\"center\"]').textContent = t('positionCenter');\n    ui.launcherPosition.querySelector('option[value=\"center-right\"]').textContent = t('positionCenterRight');\n    ui.launcherPosition.querySelector('option[value=\"bottom-left\"]').textContent = t('positionBottomLeft');\n    ui.launcherPosition.querySelector('option[value=\"bottom\"]').textContent = t('positionBottom');\n    ui.launcherPosition.querySelector('option[value=\"bottom-right\"]').textContent = t('positionBottomRight');\n    ui.panelWidth.querySelector")
+
+          p.write_text(text, encoding='utf-8')
+
+          meta = Path('media finder.meta.js')
+          mt = meta.read_text(encoding='utf-8')
+          if '// @version      1.7.1' not in mt:
+              raise SystemExit('Unexpected meta version')
+          meta.write_text(mt.replace('// @version      1.7.1', '// @version      1.7.2', 1), encoding='utf-8')
+      - name: Validate
+        run: node --check 'media finder.user.js'
+      - name: Commit patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f '.github/workflows/media-finder-launcher-position.yml'
+          git add 'media finder.user.js' 'media finder.meta.js' '.github/workflows/media-finder-launcher-position.yml'
+          git commit -m 'feat: customize Media Finder toggle position'
+          git push origin HEAD:main
