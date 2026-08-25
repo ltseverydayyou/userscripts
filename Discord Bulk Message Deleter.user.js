@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Discord Bulk Message Deleter
 // @namespace    http://tampermonkey.net/
-// @version      1.6
-// @description  Bulk delete your own messages with rate-limit wait window
+// @version      2.0.0
+// @description  Reliably delete your own Discord messages from the current channel with cancellation, retries, and rate-limit handling.
 // @author       You
 // @match        https://discord.com/*
 // @grant        none
@@ -11,440 +11,570 @@
 (function () {
   'use strict';
 
+  if (window.__DBD_V2_LOADED__) return;
+  window.__DBD_V2_LOADED__ = true;
+
+  const API = 'https://discord.com/api/v10';
+  const STORAGE_KEY = 'dbd:v2:settings';
+  const MAX_LOG_LINES = 250;
+  const MAX_REQUEST_RETRIES = 5;
+
+  const state = {
+    running: false,
+    abortController: null,
+    deleted: 0,
+    failed: 0,
+    scanned: 0,
+    lastMessageId: null,
+    token: null,
+    currentUser: null,
+  };
+
+  const sleep = (ms, signal) => new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once: true });
+  });
+
   const style = document.createElement('style');
   style.textContent = `
+    #dbd-panel, #dbd-toggle { font-family: "gg sans", "Noto Sans", sans-serif; }
     #dbd-panel {
       position: fixed;
-      bottom: 24px;
       right: 24px;
-      z-index: 99999;
+      bottom: 24px;
+      z-index: 2147483647;
+      width: 320px;
+      box-sizing: border-box;
+      padding: 16px;
+      color: #dbdee1;
       background: #1e1f22;
       border: 1px solid #3f4147;
       border-radius: 12px;
-      padding: 16px;
-      width: 280px;
-      font-family: 'gg sans', sans-serif;
-      color: #dbdee1;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      box-shadow: 0 8px 28px rgba(0,0,0,.45);
+      display: none;
     }
+    #dbd-panel * { box-sizing: border-box; }
     #dbd-panel h3 {
-      margin: 0 0 14px;
-      font-size: 14px;
-      color: #fff;
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 14px;
+      color: #fff;
+      font-size: 14px;
     }
-    .dbd-row {
-      display: flex;
-      flex-direction: column;
-      margin-bottom: 10px;
-    }
+    .dbd-row { margin-bottom: 10px; }
     .dbd-row label {
+      display: block;
+      margin-bottom: 5px;
+      color: #949ba4;
       font-size: 11px;
-      color: #949ba4;
-      margin-bottom: 4px;
+      font-weight: 700;
+      letter-spacing: .45px;
       text-transform: uppercase;
-      letter-spacing: 0.5px;
     }
-    .dbd-input-wrap {
-      display: flex;
-      gap: 6px;
-      align-items: center;
-    }
-    .dbd-row input {
-      flex: 1;
-      background: #2b2d31;
+    .dbd-input-wrap { display: flex; align-items: center; gap: 6px; }
+    .dbd-input, .dbd-auto-btn {
       border: 1px solid #3f4147;
       border-radius: 6px;
+      background: #2b2d31;
       color: #dbdee1;
-      font-size: 12px;
-      padding: 6px 8px;
-      box-sizing: border-box;
+    }
+    .dbd-input {
+      min-width: 0;
+      width: 100%;
+      padding: 7px 8px;
       outline: none;
+      font-size: 12px;
     }
-    .dbd-row input:focus {
-      border-color: #5865f2;
-    }
-    .dbd-row input::placeholder {
-      color: #4e5058;
-    }
+    .dbd-input:focus { border-color: #5865f2; }
+    .dbd-input:disabled { opacity: .6; cursor: not-allowed; }
     .dbd-auto-btn {
-      background: #2b2d31;
-      border: 1px solid #3f4147;
-      border-radius: 6px;
-      color: #949ba4;
-      font-size: 10px;
-      padding: 6px 8px;
+      flex: 0 0 auto;
+      padding: 7px 9px;
       cursor: pointer;
-      white-space: nowrap;
-      flex-shrink: 0;
+      font-size: 10px;
     }
-    .dbd-auto-btn:hover {
-      background: #313338;
-      color: #dbdee1;
-    }
-    .dbd-divider {
-      border: none;
-      border-top: 1px solid #3f4147;
+    .dbd-auto-btn:hover { background: #35373c; }
+    .dbd-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
       margin: 12px 0;
     }
-    #dbd-panel button.dbd-main {
-      width: 100%;
-      padding: 9px;
-      border: none;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 600;
-      cursor: pointer;
-      margin-bottom: 6px;
-    }
-    #dbd-start  { background: #5865f2; color: #fff; }
-    #dbd-start:hover { background: #4752c4; }
-    #dbd-stop   { background: #ed4245; color: #fff; display: none; }
-    #dbd-stop:hover { background: #c03537; }
-    #dbd-log {
-      margin-top: 10px;
+    .dbd-stat {
+      padding: 8px 6px;
+      text-align: center;
       background: #2b2d31;
       border-radius: 6px;
-      padding: 8px;
-      font-size: 11px;
-      color: #949ba4;
-      height: 90px;
-      overflow-y: auto;
-      line-height: 1.6;
     }
+    .dbd-stat strong { display: block; color: #fff; font-size: 14px; }
+    .dbd-stat span { color: #949ba4; font-size: 9px; text-transform: uppercase; }
+    .dbd-divider { border: 0; border-top: 1px solid #3f4147; margin: 12px 0; }
+    .dbd-main {
+      width: 100%;
+      padding: 9px;
+      margin-bottom: 6px;
+      border: 0;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    #dbd-start { background: #5865f2; }
+    #dbd-start:hover { background: #4752c4; }
+    #dbd-stop { display: none; background: #da373c; }
+    #dbd-stop:hover { background: #a1282d; }
+    #dbd-log {
+      height: 126px;
+      margin-top: 8px;
+      padding: 8px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #b5bac1;
+      background: #111214;
+      border-radius: 6px;
+      font: 11px/1.45 Consolas, monospace;
+    }
+    .dbd-log-error { color: #f23f42; }
+    .dbd-log-warn { color: #f0b232; }
+    .dbd-log-ok { color: #23a559; }
     #dbd-toggle {
       position: fixed;
-      bottom: 24px;
       right: 24px;
-      z-index: 99999;
-      background: #5865f2;
-      color: #fff;
-      border: none;
-      border-radius: 50%;
-      width: 48px;
-      height: 48px;
-      font-size: 20px;
-      cursor: pointer;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      bottom: 24px;
+      z-index: 2147483647;
       display: flex;
       align-items: center;
       justify-content: center;
+      width: 48px;
+      height: 48px;
+      border: 0;
+      border-radius: 50%;
+      color: #fff;
+      background: #5865f2;
+      box-shadow: 0 4px 14px rgba(0,0,0,.4);
+      cursor: pointer;
+      font-size: 20px;
     }
     #dbd-toggle:hover { background: #4752c4; }
     #dbd-close {
-      background: none;
-      border: none;
-      color: #949ba4;
-      font-size: 20px;
-      cursor: pointer;
       padding: 0;
-      margin: 0;
+      border: 0;
+      color: #949ba4;
+      background: transparent;
+      cursor: pointer;
+      font-size: 20px;
     }
-    #dbd-close:hover { color: #dbdee1; }
+    #dbd-close:hover { color: #fff; }
+    .dbd-note { color: #949ba4; font-size: 10px; line-height: 1.35; margin-top: 5px; }
   `;
   document.head.appendChild(style);
 
   const toggleBtn = document.createElement('button');
   toggleBtn.id = 'dbd-toggle';
-  toggleBtn.title = 'Discord Bulk Deleter';
+  toggleBtn.type = 'button';
+  toggleBtn.title = 'Discord Bulk Message Deleter';
   toggleBtn.textContent = '🗑️';
   document.body.appendChild(toggleBtn);
 
   const panel = document.createElement('div');
   panel.id = 'dbd-panel';
-  panel.style.display = 'none';
   panel.innerHTML = `
     <h3>
       <span>🗑️ Bulk Message Deleter</span>
-      <button id="dbd-close">✕</button>
+      <button id="dbd-close" type="button" aria-label="Close">✕</button>
     </h3>
 
     <div class="dbd-row">
-      <label>Channel ID</label>
+      <label for="dbd-channel">Channel ID</label>
       <div class="dbd-input-wrap">
-        <input id="dbd-channel" type="text" placeholder="Auto-detected from URL" />
-        <button class="dbd-auto-btn" id="dbd-detect-channel">Auto</button>
+        <input class="dbd-input" id="dbd-channel" type="text" inputmode="numeric" placeholder="Auto-detected from URL">
+        <button class="dbd-auto-btn" id="dbd-detect-channel" type="button">Auto</button>
       </div>
     </div>
 
     <div class="dbd-row">
-      <label>User ID</label>
-      <div class="dbd-input-wrap">
-        <input id="dbd-user" type="text" placeholder="Auto-detected from session" />
-        <button class="dbd-auto-btn" id="dbd-detect-user">Auto</button>
-      </div>
+      <label for="dbd-delay">Delay between deletes (ms)</label>
+      <input class="dbd-input" id="dbd-delay" type="number" value="900" min="250" max="60000" step="50">
     </div>
 
     <div class="dbd-row">
-      <label>Delay between deletions (ms)</label>
-      <div class="dbd-input-wrap">
-        <input id="dbd-delay" type="number" value="1000" min="500" />
-      </div>
+      <label for="dbd-rate-floor">Minimum 429 wait (seconds)</label>
+      <input class="dbd-input" id="dbd-rate-floor" type="number" value="2" min="1" max="300" step="1">
+      <div class="dbd-note">Discord's retry_after value is always respected; this is only a minimum fallback.</div>
     </div>
 
-    <div class="dbd-row">
-      <label>Rate limit wait window (sec, min 10)</label>
-      <div class="dbd-input-wrap">
-        <input id="dbd-rate-delay" type="number" value="20" min="10" />
-      </div>
+    <div class="dbd-stats">
+      <div class="dbd-stat"><strong id="dbd-scanned">0</strong><span>Scanned</span></div>
+      <div class="dbd-stat"><strong id="dbd-deleted">0</strong><span>Deleted</span></div>
+      <div class="dbd-stat"><strong id="dbd-failed">0</strong><span>Failed</span></div>
     </div>
 
-    <hr class="dbd-divider" />
-
-    <button id="dbd-start" class="dbd-main">▶ Start Deleting</button>
-    <button id="dbd-stop"  class="dbd-main">⏹ Stop</button>
-    <div id="dbd-log">Fill in fields above or hit Auto, then press Start.</div>
+    <hr class="dbd-divider">
+    <button id="dbd-start" class="dbd-main" type="button">▶ Start deleting mine</button>
+    <button id="dbd-stop" class="dbd-main" type="button">⏹ Stop</button>
+    <div id="dbd-log" role="log" aria-live="polite"></div>
   `;
   document.body.appendChild(panel);
 
-  const log = (msg) => {
-    const el = document.getElementById('dbd-log');
-    el.innerHTML += msg + '<br>';
-    el.scrollTop = el.scrollHeight;
-  };
+  const $ = (id) => document.getElementById(id);
+  const inputs = [$('dbd-channel'), $('dbd-delay'), $('dbd-rate-floor'), $('dbd-detect-channel')];
 
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  function appendLog(message, type = '') {
+    const logBox = $('dbd-log');
+    const line = document.createElement('div');
+    if (type) line.className = `dbd-log-${type}`;
+    line.textContent = message;
+    logBox.appendChild(line);
 
-  const clampRateDelay = () => {
-    const el = document.getElementById('dbd-rate-delay');
-    const val = Math.max(parseFloat(el.value) || 20, 10);
-    el.value = String(val);
-    return val * 1000;
-  };
-
-  const getRateWait = async (res) => {
-    let retry = 0;
-
-    try {
-      const data = await res.clone().json();
-      if (typeof data.retry_after === 'number') {
-        retry = data.retry_after * 1000;
-      }
-    } catch {}
-
-    const hdr = res.headers.get('Retry-After');
-    if (hdr && !Number.isNaN(parseFloat(hdr))) {
-      retry = Math.max(retry, parseFloat(hdr) * 1000);
+    while (logBox.childNodes.length > MAX_LOG_LINES) {
+      logBox.removeChild(logBox.firstChild);
     }
 
-    return Math.max(retry, clampRateDelay());
-  };
+    logBox.scrollTop = logBox.scrollHeight;
+  }
 
-  const getToken = () => {
+  function updateStats() {
+    $('dbd-scanned').textContent = String(state.scanned);
+    $('dbd-deleted').textContent = String(state.deleted);
+    $('dbd-failed').textContent = String(state.failed);
+  }
+
+  function setRunning(running) {
+    state.running = running;
+    $('dbd-start').style.display = running ? 'none' : 'block';
+    $('dbd-stop').style.display = running ? 'block' : 'none';
+    for (const input of inputs) input.disabled = running;
+  }
+
+  function loadSettings() {
     try {
-      const iframe = document.createElement('iframe');
-      document.body.appendChild(iframe);
-      const token = iframe.contentWindow.localStorage.token;
-      document.body.removeChild(iframe);
-      return token ? token.replace(/"/g, '') : null;
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      if (saved.delay != null) $('dbd-delay').value = String(saved.delay);
+      if (saved.rateFloor != null) $('dbd-rate-floor').value = String(saved.rateFloor);
+    } catch {}
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        delay: normalizeDelay(),
+        rateFloor: normalizeRateFloor() / 1000,
+      }));
+    } catch {}
+  }
+
+  function detectChannelId() {
+    const match = location.pathname.match(/^\/channels\/(?:@me|\d+)\/(\d+)/);
+    return match?.[1] || null;
+  }
+
+  function normalizeSnowflake(value) {
+    const result = String(value || '').trim();
+    return /^\d{15,22}$/.test(result) ? result : null;
+  }
+
+  function normalizeDelay() {
+    const value = Math.trunc(Number($('dbd-delay').value));
+    const fixed = Number.isFinite(value) ? Math.min(Math.max(value, 250), 60000) : 900;
+    $('dbd-delay').value = String(fixed);
+    return fixed;
+  }
+
+  function normalizeRateFloor() {
+    const value = Number($('dbd-rate-floor').value);
+    const fixed = Number.isFinite(value) ? Math.min(Math.max(value, 1), 300) : 2;
+    $('dbd-rate-floor').value = String(fixed);
+    return fixed * 1000;
+  }
+
+  function getTokenFromLocalStorage() {
+    try {
+      const token = localStorage.getItem('token');
+      return token ? JSON.parse(token) : null;
     } catch {
       return null;
     }
-  };
+  }
 
-  const detectChannel = () => {
-    const match = window.location.href.match(/channels\/(?:\d+|@me)\/(\d+)/);
-    return match ? match[1] : null;
-  };
+  function getTokenFromWebpack() {
+    try {
+      const chunk = window.webpackChunkdiscord_app;
+      if (!Array.isArray(chunk)) return null;
 
-  const stop = () => {
-    running = false;
-    document.getElementById('dbd-start').style.display = 'block';
-    document.getElementById('dbd-stop').style.display = 'none';
-  };
+      let requireFn;
+      chunk.push([[Symbol('dbd')], {}, (req) => { requireFn = req; }]);
+      chunk.pop();
+      if (!requireFn?.c) return null;
 
-  document.getElementById('dbd-close').addEventListener('click', () => {
+      for (const module of Object.values(requireFn.c)) {
+        const exports = module?.exports;
+        if (!exports) continue;
+
+        const candidates = [exports, exports.default, exports.Z, exports.ZP];
+        for (const candidate of candidates) {
+          if (!candidate || typeof candidate.getToken !== 'function') continue;
+          try {
+            const token = candidate.getToken();
+            if (typeof token === 'string' && token.length > 20) return token;
+          } catch {}
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  function getToken() {
+    return getTokenFromWebpack() || getTokenFromLocalStorage();
+  }
+
+  async function parseBody(response) {
+    const text = await response.text().catch(() => '');
+    if (!text) return null;
+    try { return JSON.parse(text); } catch { return text; }
+  }
+
+  function retryAfterMs(response, body) {
+    let ms = 0;
+
+    if (body && typeof body === 'object' && Number.isFinite(Number(body.retry_after))) {
+      const retry = Number(body.retry_after);
+      ms = Math.max(ms, retry > 1000 ? retry : retry * 1000);
+    }
+
+    const retryAfter = Number(response.headers.get('Retry-After'));
+    if (Number.isFinite(retryAfter)) ms = Math.max(ms, retryAfter * 1000);
+
+    const resetAfter = Number(response.headers.get('X-RateLimit-Reset-After'));
+    if (Number.isFinite(resetAfter)) ms = Math.max(ms, resetAfter * 1000);
+
+    return Math.max(ms, normalizeRateFloor()) + 250;
+  }
+
+  async function apiRequest(path, options = {}) {
+    const signal = state.abortController?.signal;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= MAX_REQUEST_RETRIES; attempt++) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+      try {
+        const response = await fetch(`${API}${path}`, {
+          ...options,
+          signal,
+          headers: {
+            Authorization: state.token,
+            ...(options.headers || {}),
+          },
+        });
+
+        const body = await parseBody(response);
+
+        if (response.status === 429) {
+          const wait = retryAfterMs(response, body);
+          appendLog(`Rate limited. Waiting ${(wait / 1000).toFixed(1)}s...`, 'warn');
+          await sleep(wait, signal);
+          continue;
+        }
+
+        if (response.status >= 500 && response.status <= 599 && attempt < MAX_REQUEST_RETRIES) {
+          const wait = Math.min(1000 * (2 ** attempt), 15000) + Math.floor(Math.random() * 300);
+          appendLog(`Discord returned HTTP ${response.status}. Retrying in ${(wait / 1000).toFixed(1)}s...`, 'warn');
+          await sleep(wait, signal);
+          continue;
+        }
+
+        return { response, body };
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        lastError = error;
+
+        if (attempt >= MAX_REQUEST_RETRIES) break;
+        const wait = Math.min(750 * (2 ** attempt), 10000) + Math.floor(Math.random() * 250);
+        appendLog(`Network error. Retrying in ${(wait / 1000).toFixed(1)}s...`, 'warn');
+        await sleep(wait, signal);
+      }
+    }
+
+    throw lastError || new Error('Request failed after retries');
+  }
+
+  async function getCurrentUser() {
+    const { response, body } = await apiRequest('/users/@me');
+    if (response.status === 401) throw new Error('Discord rejected the session token (HTTP 401). Reload Discord and try again.');
+    if (!response.ok) throw new Error(`Could not identify the current account (HTTP ${response.status}${body?.message ? `: ${body.message}` : ''}).`);
+    return body;
+  }
+
+  function messagePreview(message) {
+    let content = typeof message?.content === 'string' ? message.content.replace(/\s+/g, ' ').trim() : '';
+    if (!content) {
+      if (message?.attachments?.length) content = '[attachment]';
+      else if (message?.embeds?.length) content = '[embed]';
+      else content = '[empty message]';
+    }
+    return content.length > 52 ? `${content.slice(0, 49)}...` : content;
+  }
+
+  async function deleteMessage(channelId, message) {
+    const { response, body } = await apiRequest(`/channels/${channelId}/messages/${message.id}`, { method: 'DELETE' });
+
+    if (response.status === 204 || response.status === 404) return true;
+
+    if (response.status === 401) {
+      throw new Error('Authorization expired while deleting (HTTP 401). Reload Discord and try again.');
+    }
+
+    if (response.status === 403) {
+      appendLog(`Skipped ${message.id}: Discord refused deletion (HTTP 403).`, 'warn');
+      return false;
+    }
+
+    appendLog(`Failed ${message.id}: HTTP ${response.status}${body?.message ? ` — ${body.message}` : ''}`, 'error');
+    return false;
+  }
+
+  async function runDeletion() {
+    if (state.running) return;
+
+    $('dbd-log').textContent = '';
+    state.deleted = 0;
+    state.failed = 0;
+    state.scanned = 0;
+    state.lastMessageId = null;
+    updateStats();
+
+    const detected = detectChannelId();
+    const channelId = normalizeSnowflake($('dbd-channel').value) || detected;
+    if (!channelId) {
+      appendLog('No valid channel ID. Open a Discord channel/DM or enter its ID.', 'error');
+      return;
+    }
+
+    $('dbd-channel').value = channelId;
+    normalizeDelay();
+    normalizeRateFloor();
+    saveSettings();
+
+    state.token = getToken();
+    if (!state.token) {
+      appendLog('Could not obtain the active Discord session token. Reload Discord and retry.', 'error');
+      return;
+    }
+
+    state.abortController = new AbortController();
+    setRunning(true);
+
+    try {
+      state.currentUser = await getCurrentUser();
+      appendLog(`Account: ${state.currentUser.username} (${state.currentUser.id})`, 'ok');
+      appendLog(`Scanning channel ${channelId} newest → oldest...`);
+
+      while (state.running) {
+        const params = new URLSearchParams({ limit: '100' });
+        if (state.lastMessageId) params.set('before', state.lastMessageId);
+
+        const { response, body } = await apiRequest(`/channels/${channelId}/messages?${params}`);
+
+        if (response.status === 401) throw new Error('Authorization expired while scanning (HTTP 401).');
+        if (response.status === 403) throw new Error('Discord denied access to this channel (HTTP 403).');
+        if (response.status === 404) throw new Error('Channel not found or unavailable (HTTP 404).');
+        if (!response.ok) throw new Error(`Scan failed (HTTP ${response.status}${body?.message ? `: ${body.message}` : ''}).`);
+        if (!Array.isArray(body)) throw new Error('Discord returned an unexpected message-list response.');
+
+        if (body.length === 0) {
+          appendLog(`Finished. Deleted ${state.deleted}; failed ${state.failed}.`, 'ok');
+          break;
+        }
+
+        state.lastMessageId = body[body.length - 1].id;
+        state.scanned += body.length;
+        updateStats();
+
+        const mine = body.filter((message) => message?.author?.id === state.currentUser.id);
+
+        for (const message of mine) {
+          if (!state.running) break;
+
+          const ok = await deleteMessage(channelId, message);
+          if (ok) {
+            state.deleted++;
+            appendLog(`Deleted #${state.deleted}: ${messagePreview(message)}`, 'ok');
+          } else {
+            state.failed++;
+          }
+          updateStats();
+
+          if (state.running) await sleep(normalizeDelay(), state.abortController.signal);
+        }
+      }
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        appendLog('Stopped.', 'warn');
+      } else {
+        appendLog(error?.message || String(error), 'error');
+      }
+    } finally {
+      state.running = false;
+      state.abortController = null;
+      setRunning(false);
+    }
+  }
+
+  function stopDeletion() {
+    if (!state.running) return;
+    state.running = false;
+    state.abortController?.abort();
+  }
+
+  function fillDetectedChannel(quiet = false) {
+    const id = detectChannelId();
+    if (id) {
+      $('dbd-channel').value = id;
+      if (!quiet) appendLog(`Detected channel ${id}.`, 'ok');
+      return true;
+    }
+    if (!quiet) appendLog('Could not detect a channel from the current URL.', 'error');
+    return false;
+  }
+
+  $('dbd-close').addEventListener('click', () => {
     panel.style.display = 'none';
     toggleBtn.style.display = 'flex';
   });
 
   toggleBtn.addEventListener('click', () => {
-    const visible = panel.style.display !== 'none';
-    panel.style.display = visible ? 'none' : 'block';
-    toggleBtn.style.display = visible ? 'flex' : 'none';
+    panel.style.display = 'block';
+    toggleBtn.style.display = 'none';
+    if (!state.running) fillDetectedChannel(true);
   });
 
-  document.getElementById('dbd-rate-delay').addEventListener('blur', clampRateDelay);
+  $('dbd-detect-channel').addEventListener('click', () => fillDetectedChannel(false));
+  $('dbd-start').addEventListener('click', runDeletion);
+  $('dbd-stop').addEventListener('click', stopDeletion);
+  $('dbd-delay').addEventListener('change', saveSettings);
+  $('dbd-rate-floor').addEventListener('change', saveSettings);
 
-  document.getElementById('dbd-detect-channel').addEventListener('click', () => {
-    const channelId = detectChannel();
-
-    if (channelId) {
-      document.getElementById('dbd-channel').value = channelId;
-    } else {
-      alert('❌ Could not detect channel. Make sure you are inside a channel or DM.');
-    }
+  let lastPath = location.pathname;
+  const observer = new MutationObserver(() => {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    if (!state.running) fillDetectedChannel(true);
   });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
 
-  document.getElementById('dbd-detect-user').addEventListener('click', async () => {
-    const token = getToken();
-
-    if (!token) {
-      return alert('❌ Could not get token. Make sure you are logged in.');
-    }
-
-    const res = await fetch('https://discord.com/api/v9/users/@me', {
-      headers: { Authorization: token }
-    });
-
-    const me = await res.json();
-    document.getElementById('dbd-user').value = me.id;
-  });
-
-  let running = false;
-
-  const startDeleting = async () => {
-    const delay = parseInt(document.getElementById('dbd-delay').value) || 1000;
-    let channelId = document.getElementById('dbd-channel').value.trim() || detectChannel();
-    let userId = document.getElementById('dbd-user').value.trim();
-
-    clampRateDelay();
-
-    document.getElementById('dbd-log').innerHTML = '';
-    document.getElementById('dbd-start').style.display = 'none';
-    document.getElementById('dbd-stop').style.display = 'block';
-    running = true;
-
-    if (!channelId) {
-      log('❌ No channel ID. Enter one or click Auto.');
-      return stop();
-    }
-
-    const token = getToken();
-
-    if (!token) {
-      log('❌ Could not get token. Make sure you are logged in.');
-      return stop();
-    }
-
-    if (!userId) {
-      const meRes = await fetch('https://discord.com/api/v9/users/@me', {
-        headers: { Authorization: token }
-      });
-
-      if (meRes.status === 429) {
-        const wait = await getRateWait(meRes);
-        log(`⏳ Rate limited while detecting user. Waiting ${Math.ceil(wait / 1000)}s...`);
-        await sleep(wait);
-        return startDeleting();
-      }
-
-      const me = await meRes.json();
-      userId = me.id;
-      document.getElementById('dbd-user').value = userId;
-      log(`✅ Logged in as ${me.username}`);
-    } else {
-      log(`✅ Using User ID: ${userId}`);
-    }
-
-    log(`📡 Scanning channel ${channelId}...`);
-
-    let lastId = null;
-    let totalDeleted = 0;
-
-    while (running) {
-      const url = new URL(`https://discord.com/api/v9/channels/${channelId}/messages`);
-      url.searchParams.set('limit', '100');
-
-      if (lastId) {
-        url.searchParams.set('before', lastId);
-      }
-
-      const res = await fetch(url, {
-        headers: { Authorization: token }
-      });
-
-      if (res.status === 429) {
-        const wait = await getRateWait(res);
-        log(`⏳ Rate limited while scanning. Waiting ${Math.ceil(wait / 1000)}s before continuing...`);
-        await sleep(wait);
-        continue;
-      }
-
-      if (!res.ok) {
-        let errorMsg = `HTTP ${res.status}`;
-
-        try {
-          const data = await res.json();
-          if (data.message) {
-            errorMsg += ` — ${data.message}`;
-          }
-        } catch {}
-
-        log(`❌ Scan failed: ${errorMsg}`);
-        break;
-      }
-
-      const messages = await res.json();
-
-      if (!Array.isArray(messages) || messages.length === 0) {
-        log(`✅ Done! Deleted ${totalDeleted} messages.`);
-        break;
-      }
-
-      const mine = messages.filter(m => m.author && m.author.id === userId);
-      lastId = messages[messages.length - 1].id;
-
-      if (mine.length === 0) {
-        continue;
-      }
-
-      for (const msg of mine) {
-        if (!running) {
-          break;
-        }
-
-        let deleted = false;
-
-        while (!deleted && running) {
-          const delRes = await fetch(
-            `https://discord.com/api/v9/channels/${channelId}/messages/${msg.id}`,
-            {
-              method: 'DELETE',
-              headers: { Authorization: token }
-            }
-          );
-
-          if (delRes.status === 204) {
-            totalDeleted++;
-            log(`🗑️ [${totalDeleted}] "${(msg.content || '[attachment]').slice(0, 35)}"`);
-            deleted = true;
-          } else if (delRes.status === 429) {
-            const wait = await getRateWait(delRes);
-            log(`⏳ Rate limited on delete. Waiting ${Math.ceil(wait / 1000)}s before retrying same message...`);
-            await sleep(wait);
-          } else {
-            let errorMsg = `HTTP ${delRes.status}`;
-
-            try {
-              const errData = await delRes.json();
-              if (errData.message) {
-                errorMsg += ` — ${errData.message}`;
-              }
-            } catch {}
-
-            log(`⚠️ Failed: ${errorMsg} for message ${msg.id}`);
-            deleted = true;
-          }
-        }
-
-        if (!running) {
-          break;
-        }
-
-        await sleep(delay);
-      }
-    }
-
-    stop();
-  };
-
-  document.getElementById('dbd-start').addEventListener('click', startDeleting);
-
-  document.getElementById('dbd-stop').addEventListener('click', () => {
-    running = false;
-    log('🛑 Stopped.');
-  });
+  loadSettings();
+  fillDetectedChannel(true);
+  appendLog('Ready. Open a channel/DM and press Start deleting mine.');
 })();
