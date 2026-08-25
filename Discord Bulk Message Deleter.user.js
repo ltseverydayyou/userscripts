@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Bulk Message Deleter
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
+// @version      2.1.1
 // @description  Reliably delete your own Discord messages from the current channel with retries, rate-limit handling, and a draggable UI.
 // @author       You
 // @match        https://discord.com/*
@@ -22,9 +22,12 @@
   const $ = id => document.getElementById(id);
 
   const sleep = (ms, signal) => new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(new DOMException('Aborted','AbortError'));
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted','AbortError')); }, { once:true });
+    if (signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once:true });
   });
 
   const css = document.createElement('style');
@@ -74,211 +77,385 @@
   document.body.appendChild(panel);
 
   const inputs = [$('dbd-channel'), $('dbd-delay'), $('dbd-floor'), $('dbd-detect')];
-  const readStore = () => { try { const x = JSON.parse(localStorage.getItem(STORE) || '{}'); return x && typeof x === 'object' ? x : {}; } catch { return {}; } };
+  const readStore = () => { try { const value = JSON.parse(localStorage.getItem(STORE) || '{}'); return value && typeof value === 'object' ? value : {}; } catch { return {}; } };
   const writeStore = patch => { try { localStorage.setItem(STORE, JSON.stringify({ ...readStore(), ...patch })); } catch {} };
 
-  function log(msg, type='') {
+  function log(message, type='') {
     const box = $('dbd-log');
-    $('dbd-status').textContent = type==='error'?'Error':type==='warn'?'Waiting':type==='ok'?'Active':'Working';
+    $('dbd-status').textContent = type === 'error' ? 'Error' : type === 'warn' ? 'Waiting' : type === 'ok' ? 'Active' : 'Working';
     const line = document.createElement('div');
     if (type) line.className = `dbd-log-${type}`;
-    line.textContent = msg;
+    line.textContent = message;
     box.appendChild(line);
     while (box.childNodes.length > MAX_LOG) box.removeChild(box.firstChild);
     box.scrollTop = box.scrollHeight;
   }
 
-  function stats() {
-    $('dbd-scanned').textContent = state.scanned;
-    $('dbd-deleted').textContent = state.deleted;
-    $('dbd-failed').textContent = state.failed;
+  function updateStats() {
+    $('dbd-scanned').textContent = String(state.scanned);
+    $('dbd-deleted').textContent = String(state.deleted);
+    $('dbd-failed').textContent = String(state.failed);
   }
 
-  function setRunning(v) {
-    state.running = v;
-    $('dbd-status').textContent = v ? 'Running' : 'Ready';
-    $('dbd-start').style.display = v ? 'none' : 'block';
-    $('dbd-stop').style.display = v ? 'block' : 'none';
-    inputs.forEach(x => x.disabled = v);
+  function setRunning(value) {
+    state.running = value;
+    $('dbd-status').textContent = value ? 'Running' : 'Ready';
+    $('dbd-start').style.display = value ? 'none' : 'block';
+    $('dbd-stop').style.display = value ? 'block' : 'none';
+    inputs.forEach(input => input.disabled = value);
   }
 
   function delay() {
-    const n = Math.trunc(Number($('dbd-delay').value));
-    const v = Number.isFinite(n) ? Math.min(Math.max(n,250),60000) : 900;
-    $('dbd-delay').value = v;
-    return v;
+    const input = Math.trunc(Number($('dbd-delay').value));
+    const value = Number.isFinite(input) ? Math.min(Math.max(input, 250), 60000) : 900;
+    $('dbd-delay').value = String(value);
+    return value;
   }
-  function floor() {
-    const n = Number($('dbd-floor').value);
-    const v = Number.isFinite(n) ? Math.min(Math.max(n,1),300) : 2;
-    $('dbd-floor').value = v;
-    return v * 1000;
-  }
-  function savePrefs() { writeStore({ delay:delay(), rateFloor:floor()/1000 }); }
-  function channelFromUrl() { return location.pathname.match(/^\/channels\/(?:@me|\d+)\/(\d+)/)?.[1] || null; }
-  function snowflake(v) { v = String(v || '').trim(); return /^\d{15,22}$/.test(v) ? v : null; }
 
-  function tokenFromStorage() { try { const t = localStorage.getItem('token'); return t ? JSON.parse(t) : null; } catch { return null; } }
+  function rateFloor() {
+    const input = Number($('dbd-floor').value);
+    const value = Number.isFinite(input) ? Math.min(Math.max(input, 1), 300) : 2;
+    $('dbd-floor').value = String(value);
+    return value * 1000;
+  }
+
+  function savePrefs() { writeStore({ delay:delay(), rateFloor:rateFloor() / 1000 }); }
+  function channelFromUrl() { return location.pathname.match(/^\/channels\/(?:@me|\d+)\/(\d+)/)?.[1] || null; }
+  function snowflake(value) { value = String(value || '').trim(); return /^\d{15,22}$/.test(value) ? value : null; }
+
+  function tokenFromOriginalIframe() {
+    let iframe;
+    try {
+      iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      document.body.appendChild(iframe);
+      const raw = iframe.contentWindow.localStorage.token;
+      return raw ? String(raw).replace(/"/g, '') : null;
+    } catch {
+      return null;
+    } finally {
+      iframe?.remove();
+    }
+  }
+
   function tokenFromWebpack() {
     try {
       const chunks = window.webpackChunkdiscord_app;
       if (!Array.isArray(chunks)) return null;
       let req;
-      chunks.push([[Symbol('dbd')], {}, r => { req = r; }]); chunks.pop();
+      chunks.push([[Symbol('dbd')], {}, runtime => { req = runtime; }]);
+      chunks.pop();
       if (!req?.c) return null;
       for (const mod of Object.values(req.c)) {
-        const e = mod?.exports;
-        if (!e) continue;
-        for (const c of [e,e.default,e.Z,e.ZP]) {
-          if (!c || typeof c.getToken !== 'function') continue;
-          try { const t = c.getToken(); if (typeof t === 'string' && t.length > 20) return t; } catch {}
+        const exports = mod?.exports;
+        if (!exports) continue;
+        for (const candidate of [exports, exports.default, exports.Z, exports.ZP]) {
+          if (!candidate || typeof candidate.getToken !== 'function') continue;
+          try {
+            const token = candidate.getToken();
+            if (typeof token === 'string' && token.length > 20) return token;
+          } catch {}
         }
       }
     } catch {}
     return null;
   }
-  const getToken = () => tokenFromWebpack() || tokenFromStorage();
 
-  async function body(res) {
-    const text = await res.text().catch(()=>'');
+  function tokenFromDirectStorage() {
+    try {
+      const raw = localStorage.getItem('token');
+      if (!raw) return null;
+      try {
+        const parsed = JSON.parse(raw);
+        return typeof parsed === 'string' ? parsed : null;
+      } catch {
+        return String(raw).replace(/"/g, '');
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const getToken = () => tokenFromOriginalIframe() || tokenFromWebpack() || tokenFromDirectStorage();
+
+  async function responseBody(response) {
+    const text = await response.text().catch(() => '');
     if (!text) return null;
     try { return JSON.parse(text); } catch { return text; }
   }
-  function retryMs(res, b) {
+
+  function retryMs(response, body) {
     let ms = 0;
-    if (b && typeof b === 'object' && Number.isFinite(Number(b.retry_after))) {
-      const n = Number(b.retry_after); ms = Math.max(ms, n > 1000 ? n : n * 1000);
+    if (body && typeof body === 'object' && Number.isFinite(Number(body.retry_after))) {
+      const retry = Number(body.retry_after);
+      ms = Math.max(ms, retry > 1000 ? retry : retry * 1000);
     }
-    const h = Number(res.headers.get('Retry-After')); if (Number.isFinite(h)) ms = Math.max(ms, h*1000);
-    const r = Number(res.headers.get('X-RateLimit-Reset-After')); if (Number.isFinite(r)) ms = Math.max(ms, r*1000);
-    return Math.max(ms, floor()) + 250;
+    const header = Number(response.headers.get('Retry-After'));
+    if (Number.isFinite(header)) ms = Math.max(ms, header * 1000);
+    const reset = Number(response.headers.get('X-RateLimit-Reset-After'));
+    if (Number.isFinite(reset)) ms = Math.max(ms, reset * 1000);
+    return Math.max(ms, rateFloor()) + 250;
   }
 
   async function request(path, options={}) {
     const signal = state.abort?.signal;
-    let last;
-    for (let i=0; i<=RETRIES; i++) {
-      if (signal?.aborted) throw new DOMException('Aborted','AbortError');
+    let lastError;
+    for (let attempt = 0; attempt <= RETRIES; attempt++) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       try {
-        const res = await fetch(API+path, { ...options, signal, headers:{ Authorization:state.token, ...(options.headers||{}) } });
-        const b = await body(res);
-        if (res.status === 429) { const ms=retryMs(res,b); log(`Rate limited. Waiting ${(ms/1000).toFixed(1)}s...`,'warn'); await sleep(ms,signal); continue; }
-        if (res.status >= 500 && res.status <= 599 && i < RETRIES) { const ms=Math.min(1000*(2**i),15000)+Math.random()*300; log(`Discord returned HTTP ${res.status}. Retrying...`,'warn'); await sleep(ms,signal); continue; }
-        return { res, b };
-      } catch (e) {
-        if (e?.name === 'AbortError') throw e;
-        last = e;
-        if (i >= RETRIES) break;
-        const ms=Math.min(750*(2**i),10000)+Math.random()*250; log('Network error. Retrying...','warn'); await sleep(ms,signal);
+        const response = await fetch(API + path, {
+          ...options,
+          signal,
+          headers: { Authorization:state.token, ...(options.headers || {}) }
+        });
+        const body = await responseBody(response);
+        if (response.status === 429) {
+          const wait = retryMs(response, body);
+          log(`Rate limited. Waiting ${(wait / 1000).toFixed(1)}s...`, 'warn');
+          await sleep(wait, signal);
+          continue;
+        }
+        if (response.status >= 500 && response.status <= 599 && attempt < RETRIES) {
+          const wait = Math.min(1000 * (2 ** attempt), 15000) + Math.random() * 300;
+          log(`Discord returned HTTP ${response.status}. Retrying...`, 'warn');
+          await sleep(wait, signal);
+          continue;
+        }
+        return { response, body };
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        lastError = error;
+        if (attempt >= RETRIES) break;
+        const wait = Math.min(750 * (2 ** attempt), 10000) + Math.random() * 250;
+        log('Network error. Retrying...', 'warn');
+        await sleep(wait, signal);
       }
     }
-    throw last || new Error('Request failed after retries');
+    throw lastError || new Error('Request failed after retries');
   }
 
   async function currentUser() {
-    const {res,b} = await request('/users/@me');
-    if (res.status===401) throw new Error('Discord rejected the session token (HTTP 401). Reload Discord and try again.');
-    if (!res.ok) throw new Error(`Could not identify the current account (HTTP ${res.status}${b?.message?`: ${b.message}`:''}).`);
-    return b;
+    const { response, body } = await request('/users/@me');
+    if (response.status === 401) throw new Error('Discord rejected the session token (HTTP 401). Reload Discord and try again.');
+    if (!response.ok) throw new Error(`Could not identify the current account (HTTP ${response.status}${body?.message ? `: ${body.message}` : ''}).`);
+    return body;
   }
-  function preview(m) {
-    let c = typeof m?.content === 'string' ? m.content.replace(/\s+/g,' ').trim() : '';
-    if (!c) c = m?.attachments?.length ? '[attachment]' : m?.embeds?.length ? '[embed]' : '[empty message]';
-    return c.length > 52 ? c.slice(0,49)+'...' : c;
+
+  function preview(message) {
+    let content = typeof message?.content === 'string' ? message.content.replace(/\s+/g, ' ').trim() : '';
+    if (!content) content = message?.attachments?.length ? '[attachment]' : message?.embeds?.length ? '[embed]' : '[empty message]';
+    return content.length > 52 ? content.slice(0, 49) + '...' : content;
   }
-  async function removeMessage(channel,m) {
-    const {res,b} = await request(`/channels/${channel}/messages/${m.id}`, {method:'DELETE'});
-    if (res.status===204 || res.status===404) return true;
-    if (res.status===401) throw new Error('Authorization expired while deleting (HTTP 401). Reload Discord and try again.');
-    if (res.status===403) { log(`Skipped ${m.id}: Discord refused deletion (HTTP 403).`,'warn'); return false; }
-    log(`Failed ${m.id}: HTTP ${res.status}${b?.message?` — ${b.message}`:''}`,'error'); return false;
+
+  async function removeMessage(channel, message) {
+    const { response, body } = await request(`/channels/${channel}/messages/${message.id}`, { method:'DELETE' });
+    if (response.status === 204 || response.status === 404) return true;
+    if (response.status === 401) throw new Error('Authorization expired while deleting (HTTP 401). Reload Discord and try again.');
+    if (response.status === 403) {
+      log(`Skipped ${message.id}: Discord refused deletion (HTTP 403).`, 'warn');
+      return false;
+    }
+    log(`Failed ${message.id}: HTTP ${response.status}${body?.message ? ` — ${body.message}` : ''}`, 'error');
+    return false;
   }
 
   async function run() {
     if (state.running) return;
-    $('dbd-log').textContent='';
-    Object.assign(state,{deleted:0,failed:0,scanned:0,before:null}); stats();
+    $('dbd-log').textContent = '';
+    Object.assign(state, { deleted:0, failed:0, scanned:0, before:null });
+    updateStats();
+
     const channel = snowflake($('dbd-channel').value) || channelFromUrl();
-    if (!channel) return log('No valid channel ID. Open a Discord channel/DM or enter its ID.','error');
-    $('dbd-channel').value=channel; savePrefs();
-    state.token=getToken();
-    if (!state.token) return log('Could not obtain the active Discord session token. Reload Discord and retry.','error');
-    state.abort=new AbortController(); setRunning(true);
+    if (!channel) return log('No valid channel ID. Open a Discord channel/DM or enter its ID.', 'error');
+    $('dbd-channel').value = channel;
+    savePrefs();
+
+    state.token = getToken();
+    if (!state.token) return log('Could not obtain the active Discord session token. Reload Discord and retry.', 'error');
+
+    state.abort = new AbortController();
+    setRunning(true);
     try {
-      state.user=await currentUser();
-      log(`Account: ${state.user.username} (${state.user.id})`,'ok');
+      state.user = await currentUser();
+      log(`Account: ${state.user.username} (${state.user.id})`, 'ok');
       log(`Scanning channel ${channel} newest → oldest...`);
+
       while (state.running) {
-        const q=new URLSearchParams({limit:'100'}); if (state.before) q.set('before',state.before);
-        const {res,b}=await request(`/channels/${channel}/messages?${q}`);
-        if (res.status===401) throw new Error('Authorization expired while scanning (HTTP 401).');
-        if (res.status===403) throw new Error('Discord denied access to this channel (HTTP 403).');
-        if (res.status===404) throw new Error('Channel not found or unavailable (HTTP 404).');
-        if (!res.ok) throw new Error(`Scan failed (HTTP ${res.status}${b?.message?`: ${b.message}`:''}).`);
-        if (!Array.isArray(b)) throw new Error('Discord returned an unexpected message-list response.');
-        if (!b.length) { log(`Finished. Deleted ${state.deleted}; failed ${state.failed}.`,'ok'); break; }
-        state.before=b.at(-1).id; state.scanned+=b.length; stats();
-        for (const m of b.filter(x=>x?.author?.id===state.user.id)) {
+        const params = new URLSearchParams({ limit:'100' });
+        if (state.before) params.set('before', state.before);
+        const { response, body } = await request(`/channels/${channel}/messages?${params}`);
+        if (response.status === 401) throw new Error('Authorization expired while scanning (HTTP 401).');
+        if (response.status === 403) throw new Error('Discord denied access to this channel (HTTP 403).');
+        if (response.status === 404) throw new Error('Channel not found or unavailable (HTTP 404).');
+        if (!response.ok) throw new Error(`Scan failed (HTTP ${response.status}${body?.message ? `: ${body.message}` : ''}).`);
+        if (!Array.isArray(body)) throw new Error('Discord returned an unexpected message-list response.');
+        if (!body.length) {
+          log(`Finished. Deleted ${state.deleted}; failed ${state.failed}.`, 'ok');
+          break;
+        }
+
+        state.before = body.at(-1).id;
+        state.scanned += body.length;
+        updateStats();
+
+        for (const message of body.filter(item => item?.author?.id === state.user.id)) {
           if (!state.running) break;
-          if (await removeMessage(channel,m)) { state.deleted++; log(`Deleted #${state.deleted}: ${preview(m)}`,'ok'); } else state.failed++;
-          stats();
-          if (state.running) await sleep(delay(),state.abort.signal);
+          if (await removeMessage(channel, message)) {
+            state.deleted++;
+            log(`Deleted #${state.deleted}: ${preview(message)}`, 'ok');
+          } else {
+            state.failed++;
+          }
+          updateStats();
+          if (state.running) await sleep(delay(), state.abort.signal);
         }
       }
-    } catch (e) { log(e?.name==='AbortError'?'Stopped.':(e?.message||String(e)),e?.name==='AbortError'?'warn':'error'); }
-    finally { state.running=false; state.abort=null; setRunning(false); }
+    } catch (error) {
+      const stopped = error?.name === 'AbortError';
+      log(stopped ? 'Stopped.' : (error?.message || String(error)), stopped ? 'warn' : 'error');
+    } finally {
+      state.running = false;
+      state.abort = null;
+      setRunning(false);
+    }
   }
 
   function detect(quiet=false) {
-    const id=channelFromUrl();
-    if (id) { $('dbd-channel').value=id; if (!quiet) log(`Detected channel ${id}.`,'ok'); return true; }
-    if (!quiet) log('Could not detect a channel from the current URL.','error');
+    const id = channelFromUrl();
+    if (id) {
+      $('dbd-channel').value = id;
+      if (!quiet) log(`Detected channel ${id}.`, 'ok');
+      return true;
+    }
+    if (!quiet) log('Could not detect a channel from the current URL.', 'error');
     return false;
   }
 
-  function clamp(el,x,y) {
-    const r=el.getBoundingClientRect();
-    const maxX=Math.max(MARGIN,innerWidth-r.width-MARGIN), maxY=Math.max(MARGIN,innerHeight-r.height-MARGIN);
-    return {x:Math.min(Math.max(Number.isFinite(x)?x:MARGIN,MARGIN),maxX),y:Math.min(Math.max(Number.isFinite(y)?y:MARGIN,MARGIN),maxY)};
+  function clamp(element, x, y) {
+    const rect = element.getBoundingClientRect();
+    const maxX = Math.max(MARGIN, innerWidth - rect.width - MARGIN);
+    const maxY = Math.max(MARGIN, innerHeight - rect.height - MARGIN);
+    return {
+      x:Math.min(Math.max(Number.isFinite(x) ? x : MARGIN, MARGIN), maxX),
+      y:Math.min(Math.max(Number.isFinite(y) ? y : MARGIN, MARGIN), maxY)
+    };
   }
-  function position(el,x,y) {
-    const p=clamp(el,x,y); Object.assign(el.style,{left:`${Math.round(p.x)}px`,top:`${Math.round(p.y)}px`,right:'auto',bottom:'auto',transform:'none'}); return p;
-  }
-  function restore(el,saved,fallback) {
-    if (saved && Number.isFinite(Number(saved.x)) && Number.isFinite(Number(saved.y))) return position(el,Number(saved.x),Number(saved.y));
-    if (fallback) return position(el,fallback.x,fallback.y);
-    requestAnimationFrame(()=>{ const r=el.getBoundingClientRect(); position(el,(innerWidth-r.width)/2,96); });
-  }
-  function persist(el,key) { const r=el.getBoundingClientRect(); writeStore({[key]:{x:Math.round(r.left),y:Math.round(r.top)}}); }
-  function draggable(el,handle,key,suppressClick=false) {
-    let d=null,moved=false,suppress=false;
-    handle.addEventListener('pointerdown',e=>{
-      if (e.button!==undefined && e.button!==0) return;
-      const interactive=e.target.closest('button,input,select,textarea,a'); if (interactive && interactive!==handle) return;
-      const r=el.getBoundingClientRect(); d={id:e.pointerId,x:e.clientX,y:e.clientY,left:r.left,top:r.top}; moved=false; handle.setPointerCapture?.(e.pointerId); e.preventDefault();
+
+  function position(element, x, y) {
+    const point = clamp(element, x, y);
+    Object.assign(element.style, {
+      left:`${Math.round(point.x)}px`, top:`${Math.round(point.y)}px`, right:'auto', bottom:'auto', transform:'none'
     });
-    handle.addEventListener('pointermove',e=>{ if(!d||e.pointerId!==d.id)return; const dx=e.clientX-d.x,dy=e.clientY-d.y; if(!moved&&Math.hypot(dx,dy)<4)return; moved=true; position(el,d.left+dx,d.top+dy); e.preventDefault(); });
-    const end=e=>{ if(!d||e.pointerId!==d.id)return; if(moved){persist(el,key); if(suppressClick)suppress=true;} try{handle.releasePointerCapture?.(e.pointerId);}catch{} d=null; e.preventDefault(); };
-    handle.addEventListener('pointerup',end); handle.addEventListener('pointercancel',end);
-    return ()=>{ if(!suppress)return false; suppress=false; return true; };
+    return point;
   }
 
-  const saved=readStore();
-  if(saved.delay!=null)$('dbd-delay').value=saved.delay;
-  if(saved.rateFloor!=null)$('dbd-floor').value=saved.rateFloor;
-  restore(toggle,saved.togglePosition,{x:20,y:120});
-  const consumeDrag=draggable(toggle,toggle,'togglePosition',true);
-  draggable(panel,$('dbd-dragbar'),'panelPosition');
+  function restore(element, saved, fallback) {
+    if (saved && Number.isFinite(Number(saved.x)) && Number.isFinite(Number(saved.y))) return position(element, Number(saved.x), Number(saved.y));
+    if (fallback) return position(element, fallback.x, fallback.y);
+    requestAnimationFrame(() => {
+      const rect = element.getBoundingClientRect();
+      position(element, (innerWidth - rect.width) / 2, 96);
+    });
+  }
 
-  $('dbd-close').addEventListener('click',()=>{panel.style.display='none';toggle.style.display='flex';});
-  toggle.addEventListener('click',()=>{if(consumeDrag())return;panel.style.display='block';toggle.style.display='none';restore(panel,readStore().panelPosition,null);if(!state.running)detect(true);});
-  $('dbd-detect').addEventListener('click',()=>detect(false));
-  $('dbd-start').addEventListener('click',run);
-  $('dbd-stop').addEventListener('click',()=>{if(state.running){state.running=false;state.abort?.abort();}});
-  $('dbd-delay').addEventListener('change',savePrefs); $('dbd-floor').addEventListener('change',savePrefs);
-  addEventListener('resize',()=>{if(toggle.style.display!=='none'){const r=toggle.getBoundingClientRect();position(toggle,r.left,r.top);persist(toggle,'togglePosition');}if(panel.style.display!=='none'){const r=panel.getBoundingClientRect();position(panel,r.left,r.top);persist(panel,'panelPosition');}});
+  function persist(element, key) {
+    const rect = element.getBoundingClientRect();
+    writeStore({ [key]:{ x:Math.round(rect.left), y:Math.round(rect.top) } });
+  }
 
-  let lastPath=location.pathname;
-  new MutationObserver(()=>{if(location.pathname!==lastPath){lastPath=location.pathname;if(!state.running)detect(true);}}).observe(document.documentElement,{childList:true,subtree:true});
-  detect(true); log('Ready. Drag the launcher anywhere, open it, then press Start deleting my messages.');
+  function draggable(element, handle, key, suppressClick=false) {
+    let drag = null;
+    let moved = false;
+    let suppress = false;
+
+    handle.addEventListener('pointerdown', event => {
+      if (event.button !== undefined && event.button !== 0) return;
+      const interactive = event.target.closest('button,input,select,textarea,a');
+      if (interactive && interactive !== handle) return;
+      const rect = element.getBoundingClientRect();
+      drag = { id:event.pointerId, x:event.clientX, y:event.clientY, left:rect.left, top:rect.top };
+      moved = false;
+      handle.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    });
+
+    handle.addEventListener('pointermove', event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const dx = event.clientX - drag.x;
+      const dy = event.clientY - drag.y;
+      if (!moved && Math.hypot(dx, dy) < 4) return;
+      moved = true;
+      position(element, drag.left + dx, drag.top + dy);
+      event.preventDefault();
+    });
+
+    const end = event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      if (moved) {
+        persist(element, key);
+        if (suppressClick) suppress = true;
+      }
+      try { handle.releasePointerCapture?.(event.pointerId); } catch {}
+      drag = null;
+      event.preventDefault();
+    };
+
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+    return () => {
+      if (!suppress) return false;
+      suppress = false;
+      return true;
+    };
+  }
+
+  const saved = readStore();
+  if (saved.delay != null) $('dbd-delay').value = String(saved.delay);
+  if (saved.rateFloor != null) $('dbd-floor').value = String(saved.rateFloor);
+  restore(toggle, saved.togglePosition, { x:20, y:120 });
+  const consumeDrag = draggable(toggle, toggle, 'togglePosition', true);
+  draggable(panel, $('dbd-dragbar'), 'panelPosition');
+
+  $('dbd-close').addEventListener('click', () => { panel.style.display = 'none'; toggle.style.display = 'flex'; });
+  toggle.addEventListener('click', () => {
+    if (consumeDrag()) return;
+    panel.style.display = 'block';
+    toggle.style.display = 'none';
+    restore(panel, readStore().panelPosition, null);
+    if (!state.running) detect(true);
+  });
+  $('dbd-detect').addEventListener('click', () => detect(false));
+  $('dbd-start').addEventListener('click', run);
+  $('dbd-stop').addEventListener('click', () => {
+    if (state.running) {
+      state.running = false;
+      state.abort?.abort();
+    }
+  });
+  $('dbd-delay').addEventListener('change', savePrefs);
+  $('dbd-floor').addEventListener('change', savePrefs);
+
+  addEventListener('resize', () => {
+    if (toggle.style.display !== 'none') {
+      const rect = toggle.getBoundingClientRect();
+      position(toggle, rect.left, rect.top);
+      persist(toggle, 'togglePosition');
+    }
+    if (panel.style.display !== 'none') {
+      const rect = panel.getBoundingClientRect();
+      position(panel, rect.left, rect.top);
+      persist(panel, 'panelPosition');
+    }
+  });
+
+  let lastPath = location.pathname;
+  new MutationObserver(() => {
+    if (location.pathname !== lastPath) {
+      lastPath = location.pathname;
+      if (!state.running) detect(true);
+    }
+  }).observe(document.documentElement, { childList:true, subtree:true });
+
+  detect(true);
+  log('Ready. Drag the launcher anywhere, open it, then press Start deleting my messages.');
 })();
