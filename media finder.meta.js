@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.8.1
+// @version      1.8.2
 // @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing, extractor-page detection, and richer download UX
 // @match        *://*/*
 // @noframes
