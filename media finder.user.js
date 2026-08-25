@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.8.0
+// @version      1.8.1
 // @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing, extractor-page detection, and richer download UX
 // @match        *://*/*
 // @noframes
@@ -2221,6 +2221,319 @@
         .mf_actions { width: 100%; justify-content:stretch; }
         .mf_actions button { flex: 1 1 100%; min-height: 42px; }
       }
+
+      /* v1.8.x UI polish */
+      @keyframes mfItemIn {
+        from { opacity: 0; transform: translateY(10px) scale(.992); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
+      }
+      @keyframes mfPreviewIn {
+        from { opacity: 0; transform: translateY(8px) scale(.99); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
+      }
+      @keyframes mfToastIn {
+        from { opacity: 0; transform: translateY(-8px) scale(.985); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
+      }
+
+      .mf_stage {
+        gap: 0;
+        transition: gap var(--mf-dur-med) var(--mf-ease);
+      }
+      .mf_stage:has(.mf_previewdock.mf_open) { gap: 16px; }
+      .mf_panel {
+        box-shadow:
+          0 1px 0 rgba(255,255,255,.035) inset,
+          0 28px 80px rgba(2,1,8,.68),
+          0 0 0 1px rgba(181,140,255,.05);
+      }
+      .mf_backdrop {
+        background:
+          radial-gradient(circle at 50% 20%, rgba(120,78,190,.09), transparent 36%),
+          var(--mf-backdrop);
+        transition: opacity var(--mf-dur-med) var(--mf-ease), backdrop-filter var(--mf-dur-med) var(--mf-ease);
+      }
+      .mf_backdrop:not(.mf_visible) { backdrop-filter: blur(2px); }
+      .mf_backdrop.mf_visible { backdrop-filter: blur(12px); }
+
+      .mf_hdr {
+        position: relative;
+        flex-wrap: nowrap;
+        min-height: 62px;
+        background:
+          linear-gradient(180deg, rgba(25,15,43,.92), rgba(12,8,22,.72));
+        box-shadow: 0 10px 30px rgba(3,1,9,.18);
+      }
+      .mf_hdr::after {
+        content: "";
+        position: absolute;
+        left: 12px;
+        right: 12px;
+        bottom: -1px;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, rgba(181,140,255,.34), transparent);
+        pointer-events: none;
+      }
+      .mf_headeractions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .mf_brandlink {
+        transition: transform var(--mf-dur-med) var(--mf-ease), border-color var(--mf-dur-fast) var(--mf-ease), box-shadow var(--mf-dur-med) var(--mf-ease);
+      }
+      .mf_brandlink:hover {
+        transform: translateY(-1px) rotate(-3deg) scale(1.04);
+        border-color: var(--mf-border-strong);
+        box-shadow: 0 9px 24px rgba(8,3,19,.34), 0 0 0 3px rgba(181,140,255,.08);
+      }
+      .mf_title {
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: .015em;
+      }
+      .mf_sub { font-size: 11.5px; }
+
+      .mf_row {
+        display: grid;
+        grid-template-columns: minmax(240px, 1.7fr) repeat(3, minmax(112px, .55fr)) repeat(4, auto);
+        align-items: center;
+        background: rgba(8,5,15,.76);
+        box-shadow: 0 10px 26px rgba(3,1,9,.10);
+      }
+      .mf_inp,
+      .mf_sel,
+      .mf_iconbtn,
+      .mf_actions button {
+        transition:
+          transform var(--mf-dur-fast) var(--mf-ease),
+          background var(--mf-dur-fast) var(--mf-ease),
+          border-color var(--mf-dur-fast) var(--mf-ease),
+          box-shadow var(--mf-dur-fast) var(--mf-ease),
+          opacity var(--mf-dur-fast) linear;
+      }
+      .mf_inp,
+      .mf_sel {
+        min-height: 36px;
+      }
+      .mf_inp:hover,
+      .mf_sel:hover {
+        border-color: rgba(181,140,255,.30);
+        background: rgba(30,18,51,.96);
+      }
+      .mf_iconbtn:active,
+      .mf_actions button:active {
+        transform: translateY(1px) scale(.975);
+        transition-duration: 70ms;
+      }
+      .mf_closebtn {
+        background: rgba(82,31,62,.70);
+        border-color: rgba(255,145,181,.20);
+      }
+      .mf_closebtn:hover {
+        background: rgba(111,39,77,.84);
+        border-color: rgba(255,145,181,.34);
+      }
+
+      .mf_customizer {
+        display: grid;
+        margin: 0 12px;
+        padding: 0 10px;
+        max-height: 0;
+        opacity: 0;
+        visibility: hidden;
+        overflow: hidden;
+        transform: translateY(-6px) scale(.995);
+        border-width: 0;
+        transition:
+          max-height var(--mf-dur-slow) var(--mf-ease),
+          opacity var(--mf-dur-med) var(--mf-ease),
+          transform var(--mf-dur-med) var(--mf-ease),
+          margin var(--mf-dur-med) var(--mf-ease),
+          padding var(--mf-dur-med) var(--mf-ease),
+          border-width var(--mf-dur-fast) linear;
+        animation: none;
+      }
+      .mf_customizer.mf_open {
+        display: grid;
+        margin: 10px 12px 0;
+        padding: 10px;
+        max-height: 460px;
+        opacity: 1;
+        visibility: visible;
+        transform: translateY(0) scale(1);
+        border-width: 1px;
+      }
+      .mf_field {
+        transition: transform var(--mf-dur-fast) var(--mf-ease), border-color var(--mf-dur-fast) var(--mf-ease), background var(--mf-dur-fast) var(--mf-ease);
+      }
+      .mf_field:hover {
+        transform: translateY(-1px);
+        border-color: rgba(181,140,255,.24);
+        background: rgba(38,22,63,.52);
+      }
+
+      .mf_body {
+        padding-top: 10px;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(181,140,255,.42) transparent;
+      }
+      .mf_body::-webkit-scrollbar,
+      .mf_previewdock_body::-webkit-scrollbar { width: 9px; height: 9px; }
+      .mf_body::-webkit-scrollbar-thumb,
+      .mf_previewdock_body::-webkit-scrollbar-thumb {
+        background: rgba(181,140,255,.30);
+        border: 2px solid transparent;
+        background-clip: padding-box;
+        border-radius: 999px;
+      }
+      .mf_body::-webkit-scrollbar-thumb:hover,
+      .mf_previewdock_body::-webkit-scrollbar-thumb:hover { background-color: rgba(181,140,255,.50); }
+
+      .mf_item {
+        position: relative;
+        overflow: hidden;
+        animation: mfItemIn var(--mf-dur-slow) var(--mf-ease) backwards;
+        animation-delay: min(calc(var(--mf-item-index, 0) * var(--mf-stagger-step)), 260ms);
+      }
+      .mf_item::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 10px;
+        bottom: 10px;
+        width: 2px;
+        border-radius: 999px;
+        background: linear-gradient(180deg, transparent, var(--mf-accent), transparent);
+        opacity: 0;
+        transform: scaleY(.35);
+        transition: opacity var(--mf-dur-fast) var(--mf-ease), transform var(--mf-dur-med) var(--mf-ease);
+      }
+      .mf_item:hover::before,
+      .mf_item_selected::before { opacity: .9; transform: scaleY(1); }
+      .mf_item:hover { transform: translateY(-2px) scale(1.002); }
+      .mf_item_selected {
+        background:
+          linear-gradient(90deg, rgba(181,140,255,.075), transparent 32%),
+          linear-gradient(180deg,var(--mf-card-top),var(--mf-card-bottom));
+      }
+      .mf_badge {
+        letter-spacing: .035em;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.035);
+      }
+      .mf_url {
+        text-decoration: none;
+        transition: color var(--mf-dur-fast) var(--mf-ease), text-shadow var(--mf-dur-fast) var(--mf-ease);
+      }
+      .mf_url:hover {
+        color: #eee4ff;
+        text-shadow: 0 0 14px rgba(181,140,255,.25);
+      }
+
+      .mf_previewdock {
+        display: flex;
+        flex-basis: 0;
+        width: 0;
+        max-width: 0;
+        min-width: 0;
+        min-height: 0;
+        opacity: 0;
+        pointer-events: none;
+        border-width: 0;
+        transform: translateX(18px) scale(.985);
+        transition:
+          flex-basis var(--mf-dur-slow) var(--mf-ease),
+          width var(--mf-dur-slow) var(--mf-ease),
+          max-width var(--mf-dur-slow) var(--mf-ease),
+          opacity var(--mf-dur-med) var(--mf-ease),
+          transform var(--mf-dur-slow) var(--mf-ease),
+          border-width var(--mf-dur-fast) linear;
+      }
+      :host([data-dock-side="left"]) .mf_previewdock { transform: translateX(-18px) scale(.985); }
+      .mf_previewdock.mf_open {
+        display: flex;
+        flex-basis: min(400px, 31vw);
+        width: min(400px, 31vw);
+        max-width: min(400px, 31vw);
+        min-height: 240px;
+        opacity: 1;
+        pointer-events: auto;
+        border-width: 1px;
+        transform: translateX(0) scale(1);
+      }
+      .mf_preview_card { animation: mfPreviewIn var(--mf-dur-slow) var(--mf-ease) both; }
+      .mf_preview_player {
+        overflow: hidden;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.025), 0 14px 30px rgba(3,1,9,.20);
+      }
+
+      .mf_toast > div { animation: mfToastIn var(--mf-dur-med) var(--mf-ease) both; }
+      .mf_btn {
+        overflow: hidden;
+        isolation: isolate;
+      }
+      .mf_btn::before {
+        content: "";
+        position: absolute;
+        inset: -80% -35%;
+        z-index: 0;
+        pointer-events: none;
+        background: linear-gradient(115deg, transparent 38%, rgba(255,255,255,.10) 50%, transparent 62%);
+        transform: translateX(-55%) rotate(8deg);
+        transition: transform 560ms var(--mf-ease);
+      }
+      .mf_btn > * { position: relative; z-index: 1; }
+      .mf_btn:hover::before { transform: translateX(55%) rotate(8deg); }
+
+      :host([data-motion="off"]) *,
+      :host([data-motion="off"]) *::before,
+      :host([data-motion="off"]) *::after {
+        animation: none !important;
+        scroll-behavior: auto !important;
+      }
+
+      @media (max-width: 1180px) {
+        .mf_stage:has(.mf_previewdock.mf_open) { gap: 12px; }
+        .mf_row {
+          grid-template-columns: minmax(220px, 1fr) repeat(3, minmax(106px, .52fr));
+        }
+        .mf_previewdock.mf_open {
+          flex-basis: min(360px, 36vw);
+          width: min(360px, 36vw);
+          max-width: min(360px, 36vw);
+        }
+      }
+      @media (max-width: 900px) {
+        .mf_hdr { flex-wrap: wrap; }
+        .mf_headeractions { width: 100%; justify-content: stretch; }
+        .mf_headeractions .mf_iconbtn { flex: 1 1 auto; }
+        .mf_row { grid-template-columns: 1fr 1fr; }
+        .mf_previewdock {
+          flex-basis: 0;
+          width: 100%;
+          max-width: 100%;
+          max-height: 0;
+          transform: translateY(12px) scale(.99);
+        }
+        :host([data-dock-side="left"]) .mf_previewdock { transform: translateY(12px) scale(.99); }
+        .mf_previewdock.mf_open {
+          flex-basis: auto;
+          width: 100%;
+          max-width: 100%;
+          max-height: min(var(--mf-preview-height), min(44dvh, 420px));
+          min-height: 220px;
+          transform: translateY(0) scale(1);
+        }
+      }
+      @media (max-width: 640px) {
+        .mf_hdr { min-height: 0; }
+        .mf_headeractions { display: grid; grid-template-columns: 1fr 1fr; }
+        .mf_headeractions .mf_closebtn { grid-column: 1 / -1; }
+        .mf_row { grid-template-columns: 1fr; }
+        .mf_customizer.mf_open { max-height: 860px; }
+      }
     `;
 
     const toastWrap = document.createElement('div');
@@ -2254,11 +2567,13 @@
               </div>
             </div>
             <div class="mf_sp"></div>
-            <button class="mf_iconbtn" id="__mf_openlist__">${t('openList')}</button>
-            <button class="mf_iconbtn" id="__mf_copyall__">${t('copyAll')}</button>
-            <button class="mf_iconbtn" id="__mf_export__">${t('export')}</button>
-            <button class="mf_iconbtn" id="__mf_customize__">${t('customize')}</button>
-            <button class="mf_iconbtn" id="__mf_close__">${t('close')}</button>
+            <div class="mf_headeractions">
+              <button class="mf_iconbtn" id="__mf_openlist__">${t('openList')}</button>
+              <button class="mf_iconbtn" id="__mf_copyall__">${t('copyAll')}</button>
+              <button class="mf_iconbtn" id="__mf_export__">${t('export')}</button>
+              <button class="mf_iconbtn" id="__mf_customize__">${t('customize')}</button>
+              <button class="mf_iconbtn mf_closebtn" id="__mf_close__">${t('close')}</button>
+            </div>
           </div>
           <div class="mf_row">
             <input class="mf_inp" id="__mf_q__" placeholder="${t('search')}" />
@@ -2696,7 +3011,7 @@
     }
 
     const html = [];
-    items.slice(0, CFG.maxItems).forEach((it) => {
+    items.slice(0, CFG.maxItems).forEach((it, index) => {
       const meta = it.meta || {};
       const badge =
         it.type === 'image' ? t('filterImages') :
@@ -2716,7 +3031,7 @@
       const previewLabel = isSelected ? t('hidePreview') : t('preview');
 
       html.push(`
-        <div class="mf_item${isSelected ? ' mf_item_selected' : ''}">
+        <div class="mf_item${isSelected ? ' mf_item_selected' : ''}" style="--mf-item-index:${index}">
           <div class="mf_badge">${badge}</div>
           <div class="mf_main">
             <a class="mf_url" href="${escapeAttr(it.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(it.url)}</a>
