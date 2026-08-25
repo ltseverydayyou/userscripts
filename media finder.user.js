@@ -109,6 +109,7 @@
   const clearedBaselineUrls = new Set();
 
   const found = new Map(); // url -> {ts, from:Set, mime?, size?, note?, kind?}
+  const pendingItemAnimations = new Set(); // URLs newly detected since the last list render
   const players = new Map(); // el -> {tag, src, last, why:Set}
   const srcSeen = new Set();
 
@@ -1027,6 +1028,7 @@
     if (!found.has(u)) {
       if (found.size >= CFG.maxItems) return;
       found.set(u, { ts: now(), from: new Set(), mime: mime || '', size: meta?.size || 0, note: meta?.note || (tsSeg ? 'segment' : ''), kind: hint || '' });
+      pendingItemAnimations.add(u);
     }
 
     const it = found.get(u);
@@ -2395,6 +2397,8 @@
       .mf_item {
         position: relative;
         overflow: hidden;
+      }
+      .mf_item_new {
         animation: mfItemIn var(--mf-dur-slow) var(--mf-ease) backwards;
         animation-delay: min(calc(var(--mf-item-index, 0) * var(--mf-stagger-step)), 260ms);
       }
@@ -3006,6 +3010,7 @@
       ui.listWrap.innerHTML = `<div class="mf_item"><div class="mf_badge">${t('found')}</div><div class="mf_main">
         <div class="mf_meta">${t('noneYet')}</div>
       </div></div>`;
+      pendingItemAnimations.clear();
       renderPreviewPane(true);
       return;
     }
@@ -3031,7 +3036,7 @@
       const previewLabel = isSelected ? t('hidePreview') : t('preview');
 
       html.push(`
-        <div class="mf_item${isSelected ? ' mf_item_selected' : ''}" style="--mf-item-index:${index}">
+        <div class="mf_item${isSelected ? ' mf_item_selected' : ''}${pendingItemAnimations.has(it.url) ? ' mf_item_new' : ''}" style="--mf-item-index:${index}">
           <div class="mf_badge">${badge}</div>
           <div class="mf_main">
             <a class="mf_url" href="${escapeAttr(it.url)}" target="_blank" rel="noreferrer noopener">${escapeHtml(it.url)}</a>
@@ -3053,6 +3058,7 @@
     });
 
     ui.listWrap.innerHTML = html.join('');
+    pendingItemAnimations.clear();
 
     ui.listWrap.querySelectorAll('button[data-act]').forEach(b => {
       b.onclick = () => {
