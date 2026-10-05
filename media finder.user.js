@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.9.2
+// @version      1.9.3
 // @description  Find and download media, HLS with served AES-128 keys, clear DASH, and record players with mobile-friendly controls
 // @match        *://*/*
 // @run-at       document-start
@@ -24,6 +24,7 @@
   const inFrame = window.top !== window.self;
   const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const rawFetch = window.fetch?.bind(window);
+  const mobile = matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent || '');
 
   const INSTANCE_KEY = '__media_finder_singleton__';
   if (globalThis[INSTANCE_KEY]) return;
@@ -55,7 +56,10 @@
     bridgeTimeoutMs: 30000,
     bridgeRetryMs: 30000,
     maxParts: 20000,
-    maxMemoryBytes: matchMedia('(pointer: coarse)').matches ? 256 * 1024 * 1024 : 768 * 1024 * 1024
+    maxMemoryBytes: mobile ? 256 * 1024 * 1024 : 768 * 1024 * 1024,
+    maxRecordBytes: mobile ? 64 * 1024 * 1024 : 768 * 1024 * 1024,
+    maxSourceBytes: mobile ? 32 * 1024 * 1024 : 384 * 1024 * 1024,
+    maxWriteBytes: mobile ? 4 * 1024 * 1024 : 32 * 1024 * 1024
   };
 
   const EXT = [
@@ -131,6 +135,7 @@
   let rec = null;
   let savedBlob = null;
   let savedFiles = [];
+  const saveURLs = new Map();
   let foundRev = 0;
   let listSig = '';
   let statusText = '';
@@ -2904,7 +2909,7 @@
                 <button class="mf_iconbtn" id="__mf_stop__" hidden>Stop &amp; save</button>
                 <label>Stream quality <select class="mf_sel" id="__mf_quality__"><option value="0">Best available</option><option value="1080">Up to 1080p</option><option value="720">Up to 720p</option><option value="480">Up to 480p</option></select></label>
               </div>
-              <p>Press play first. Beginning records a seekable video at normal speed. Live players record from the current position. Stop &amp; save ends the recording early. Downloads with separate audio save two files; recording makes one file.</p>
+              <p>Press play first. Beginning records a seekable video at normal speed. Live players record from the current position. Stop &amp; save ends the recording early.${mobile ? ' Mobile recording uses up to 720p at 30fps. Use Download to keep the source quality.' : ''} Downloads with separate audio save two files; recording makes one file.</p>
             </details>
             <div class="mf_tip" id="__mf_tip__">${t('tip')}</div>
             <div class="mf_listwrap" id="__mf_list__"></div>
@@ -3744,7 +3749,8 @@
   }
 
   async function requestBytes(url, opts = {}) {
-    const first = await pullBytes(url, opts);
+    const firstOpts = opts.chunkSize && !opts.range ? { ...opts, range: { start: 0, end: Math.min(opts.chunkSize, opts.limit || CFG.maxMemoryBytes) - 1 } } : opts;
+    const first = await pullBytes(url, firstOpts);
     if (!first.range) return { ...first, data: rangeData(first.data, opts.range, first.status, '') };
     const start = opts.range?.start || 0;
     const end = opts.range?.end ?? (first.range.total === null ? null : first.range.total - 1);
@@ -3795,10 +3801,18 @@
     return mime.includes('video/mp4') ? 'mp4' : /webm/i.test(mime) ? 'webm' : mime.includes('audio/mp4') ? 'm4a' : '';
   }
 
+  function clearSaved() {
+    for (const [url, timer] of saveURLs) { clearTimeout(timer); URL.revokeObjectURL(url); }
+    saveURLs.clear();
+    savedBlob = null;
+    savedFiles = [];
+  }
+
   function saveBlob(blob, name) {
     savedBlob = { blob, name: cleanName(name) };
     if (!savedFiles.some(item => item.blob === blob)) savedFiles.push(savedBlob);
     if (inFrame) return;
+    recordingBlobs.add(blob);
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -3807,7 +3821,7 @@
     (document.body || document.documentElement).appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 120000);
+    saveURLs.set(url, setTimeout(() => { URL.revokeObjectURL(url); saveURLs.delete(url); }, 120000));
     setStatus(statusText);
   }
 
@@ -4162,8 +4176,7 @@
     if (meta.mse) { recordForUrl(url); return; }
     const task = { ctrl: new AbortController() };
     job = task;
-    savedBlob = null;
-    savedFiles = [];
+    clearSaved();
     setStatus('Fetching media…');
     try {
       const type = guessType(url, meta.mime, meta.kind);
@@ -4213,10 +4226,45 @@
     else { if (ui?.capture) ui.capture.open = true; setStatus('Select the player under Players & recording, press play, then tap Record player.'); }
   }
 
-  function recordMime(stream) {
+  function recordMime(stream, hand = mobile) {
     const video = stream.getVideoTracks().length > 0;
-    const choices = video ? ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1.42001E,mp4a.40.2', 'video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4'] : ['audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/ogg', 'audio/mp4'];
+    const mp4 = video ? ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1.42001E,mp4a.40.2'] : ['audio/mp4;codecs=mp4a.40.2'];
+    const webm = video ? ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm'] : ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/ogg'];
+    const choices = [...(hand ? webm : mp4), ...(hand ? mp4 : webm), video ? 'video/mp4' : 'audio/mp4'];
     return choices.find(value => MediaRecorder.isTypeSupported(value)) || '';
+  }
+
+  function recordSize(width, height) {
+    const scale = Math.min(1, 1280 / Math.max(width, height), 720 / Math.min(width, height));
+    return { width: Math.max(2, Math.floor(width * scale / 2) * 2), height: Math.max(2, Math.floor(height * scale / 2) * 2) };
+  }
+
+  function mobileStream(stream, el, current) {
+    const track = stream.getVideoTracks()[0];
+    if (!mobile || !track || el?.tagName !== 'VIDEO') return stream;
+    const info = track.getSettings?.() || {};
+    const width = el.videoWidth || info.width, height = el.videoHeight || info.height;
+    if (!(width > 0 && height > 0)) throw new Error('The player has no decoded video frames.');
+    if (Math.max(width, height) <= 1280 && Math.min(width, height) <= 720 && (info.frameRate || 30) <= 30) return stream;
+    const canvas = document.createElement('canvas');
+    const size = recordSize(width, height);
+    canvas.width = size.width;
+    canvas.height = size.height;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    if (!ctx || typeof canvas.captureStream !== 'function') throw new Error('This video is too large for mobile recording. Select a 720p stream or use Download.');
+    ctx.drawImage(el, 0, 0, canvas.width, canvas.height);
+    const copy = canvas.captureStream(30);
+    current.sourceStream = stream;
+    current.canvas = canvas;
+    current.drawTimer = setInterval(() => {
+      if (current.paused || current.finishing || current.cancelled) return;
+      try { if (el.readyState >= 2) ctx.drawImage(el, 0, 0, canvas.width, canvas.height); }
+      catch { stopRecord('The player could no longer be recorded. The recorded part was saved.'); }
+    }, 1000 / 30);
+    const out = new MediaStream([...copy.getVideoTracks(), ...stream.getAudioTracks()]);
+    current.stream = out;
+    track.stop();
+    return out;
   }
 
   function ebmlSize(value, width = 0) {
@@ -4363,7 +4411,7 @@
     current.setupStatus = 'Player capture blocked. Fetching an accessible recording source…';
     renderRecordStatus(current);
     const result = await requestBytes(url, {
-      signal, base: url, limit: Math.floor(CFG.maxMemoryBytes / 2),
+      signal, base: url, limit: CFG.maxSourceBytes, chunkSize: 4 * 1024 * 1024,
       progress: (loaded, total) => {
         if (rec !== current) return;
         current.setupStatus = `Fetching recording source · ${formatBytes(loaded)}${total ? ' / ' + formatBytes(total) : ''}`;
@@ -4380,7 +4428,8 @@
     if (!result.data.length || /text\/|json|xml/i.test(result.mime) || /^\s*(?:<!doctype|<html|[\[{])/i.test(head)) throw new Error('The media link returned an empty file or a web page.');
     const blob = new Blob([result.data], { type: /^(video|audio)\//i.test(result.mime) ? result.mime : '' });
     recordingBlobs.add(blob);
-    current.memoryLimit = CFG.maxMemoryBytes - blob.size;
+    current.memoryLimit = Math.min(CFG.maxRecordBytes, CFG.maxMemoryBytes - blob.size);
+    result.data = null;
     const local = document.createElement(el.tagName.toLowerCase());
     recordingPlayers.add(local);
     current.localEl = local;
@@ -4406,6 +4455,7 @@
     if (typeof capture !== 'function') throw new Error('This browser cannot capture a locally fetched player.');
     const stream = capture.call(local);
     current.stream = stream;
+    if (!el.paused && el.isConnected) { current.resumeEl = el; el.pause(); }
     checkAbort(signal);
     return stream;
   }
@@ -4413,8 +4463,14 @@
   function cleanRecordSource(current) {
     current.ctrl?.abort();
     clearInterval(current.timer);
+    clearInterval(current.drawTimer);
+    current.drawTimer = null;
     (current.localEl || current.el)?.removeEventListener('ended', current.stop);
-    for (const track of current.stream?.getTracks?.() || []) { track.removeEventListener('ended', current.trackEnd || current.stop); track.stop(); }
+    const tracks = new Set([...(current.stream?.getTracks?.() || []), ...(current.sourceStream?.getTracks?.() || [])]);
+    for (const track of tracks) { track.removeEventListener('ended', current.trackEnd || current.stop); track.stop(); }
+    if (current.canvas) { current.canvas.width = current.canvas.height = 0; current.canvas = null; }
+    current.stream = null;
+    current.sourceStream = null;
     if (current.localEl) {
       current.localEl.pause();
       current.localEl.removeAttribute('src');
@@ -4424,6 +4480,7 @@
     }
     if (current.localURL) { URL.revokeObjectURL(current.localURL); current.localURL = null; }
     if (current.loopEl) { current.loopEl.loop = current.origLoop; current.loopEl = null; }
+    if (current.resumeEl) { if (current.resumeEl.isConnected) current.resumeEl.play().catch(() => {}); current.resumeEl = null; }
   }
 
   async function startRecord(mode, toFile = false, forcedEl, forcedEntry, fromStart = recStart) {
@@ -4436,8 +4493,7 @@
       if (entry.info.protected) { setStatus('The embedded player is DRM protected. Use the site’s download option.'); return; }
       const frame = entry.frame;
       rec = { remote: frame.source, origin: frame.origin, time: now(), pending: true, paused: false };
-      savedBlob = null;
-      savedFiles = [];
+      clearSaved();
       const current = rec;
       current.timer = setTimeout(() => {
         if (rec === current && !current.started) { sendFrame(current.remote, current.origin, 'stop'); rec = null; setStatus('The embedded player did not start recording. Press play inside it and try again.'); renderCapture(); }
@@ -4452,10 +4508,9 @@
     let stream;
     let writer;
     let handle;
-    const current = { time: now(), ctrl: new AbortController(), fromStart, chunks: [], size: 0, el: mode === 'player' ? el : null, paused: false, pending: true, setupStatus: 'Starting recording…', writes: Promise.resolve(), finishing: false, reason: '' };
+    const current = { time: now(), ctrl: new AbortController(), fromStart, chunks: [], size: 0, memoryLimit: CFG.maxRecordBytes, el: mode === 'player' ? el : null, paused: false, pending: true, setupStatus: 'Starting recording…', writes: Promise.resolve(), finishing: false, reason: '' };
     rec = current;
-    savedBlob = null;
-    savedFiles = [];
+    clearSaved();
     renderRecordStatus(current);
     renderCapture();
     try {
@@ -4489,8 +4544,6 @@
             el.currentTime = 0;
             el.playbackRate = 1;
             await waitRecordMedia(el, current.ctrl.signal);
-            for (const track of stream.getTracks()) track.stop();
-            stream = capture.call(el);
             current.expected = el.duration;
           } else if (!current.localEl && Number.isFinite(el.duration)) current.expected = Math.max(0, el.duration - el.currentTime) / (el.playbackRate || 1);
         }
@@ -4503,12 +4556,14 @@
       if (rec !== current || current.cancelled) throw abortError();
       await waitTracks(stream, mode === 'player' ? current.localEl || el : null, current.ctrl.signal);
       if (rec !== current || current.cancelled) throw abortError();
+      stream = mobileStream(stream, current.localEl || el, current);
+      current.stream = stream;
       if (handle) { writer = await handle.createWritable(); current.writer = writer; }
       checkAbort(current.ctrl.signal);
       const mime = recordMime(stream);
       const video = stream.getVideoTracks()[0];
       const settings = video?.getSettings?.() || {};
-      const rate = video ? Math.min(12000000, Math.max(1000000, (settings.width || el?.videoWidth || 1280) * (settings.height || el?.videoHeight || 720) * (settings.frameRate || 30) * 0.15)) : 0;
+      const rate = video ? Math.min(mobile ? 3000000 : 12000000, Math.max(mobile ? 600000 : 1000000, (settings.width || el?.videoWidth || 1280) * (settings.height || el?.videoHeight || 720) * (settings.frameRate || 30) * 0.15)) : 0;
       const recorder = new MediaRecorder(stream, { ...(mime ? { mimeType: mime } : {}), ...(video ? { videoBitsPerSecond: rate } : {}), audioBitsPerSecond: 128000 });
       current.recorder = recorder;
       current.ext = /mp4/i.test(recorder.mimeType) ? stream.getVideoTracks().length ? 'mp4' : 'm4a' : /ogg/i.test(recorder.mimeType) ? 'ogg' : 'webm';
@@ -4527,6 +4582,8 @@
         current.size += event.data.size;
         if (event.data.type) current.mime = event.data.type;
         if (writer) {
+          current.queued = (current.queued || 0) + event.data.size;
+          if (current.queued > CFG.maxWriteBytes) { current.writeError = new Error('The output file is writing too slowly. Try a shorter recording.'); stopRecord(current.writeError.message); return; }
           current.writes = current.writes.then(async () => {
             let data = event.data;
             if (!current.header) {
@@ -4534,6 +4591,7 @@
               if (/webm/i.test(current.mime)) { const meta = await fixWebm(data, 0); current.webm = { pos: meta.pos, width: meta.width, scale: meta.scale }; data = meta.blob; }
             }
             await writer.write(data);
+            current.queued -= event.data.size;
           }).catch(error => {
             current.writeError = error;
             current.reason = 'The output file could not be written: ' + error.message;
@@ -4546,7 +4604,7 @@
       };
       recorder.onerror = event => stopRecord('The recorder failed: ' + (event.error?.message || 'unknown error'));
       recorder.onstop = () => { current.duration ??= recordSecs(current); finishRecord(current); };
-      writer ? recorder.start(1000) : recorder.start();
+      recorder.start(1000);
       current.timer = setInterval(() => {
         if (!current.localEl && current.el && !current.el.isConnected) stopRecord('The player was removed. The recorded part was saved.');
         else if (!current.localEl && (current.el?.mediaKeys || players.get(current.el)?.protected)) stopRecord('DRM was detected. Recording stopped.');
@@ -4642,6 +4700,7 @@
       if (current.expected > 0 && current.duration < current.expected - 0.4) text = `Recorded ${current.duration.toFixed(1)}s of the ${current.expected.toFixed(1)}s video. ${text}`;
     } catch (error) { blob = null; await current.writer?.abort().catch(() => {}); text = 'The recording file could not be saved: ' + error.message; }
     current.chunks.length = 0;
+    if (current.recorder) { current.recorder.ondataavailable = current.recorder.onerror = current.recorder.onstop = null; current.recorder = null; }
     if (rec === current) rec = null;
     if (inFrame) window.top.postMessage({ channel: CHANNEL, type: 'record-result', blob, name: current.name, status: text }, '*');
     else if (blob?.size) saveBlob(blob, current.name);

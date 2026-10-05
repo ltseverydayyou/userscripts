@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.9.2
+// @version      1.9.3
 // @description  Find and download media, HLS with served AES-128 keys, clear DASH, and record players with mobile-friendly controls
 // @match        *://*/*
 // @run-at       document-start

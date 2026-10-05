@@ -6,7 +6,7 @@ const { webcrypto, createCipheriv } = require('node:crypto');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'media finder.user.js'), 'utf8').replace(/\r\n/g, '\n');
-const names = ['parseHls', 'ivBytes', 'byteRange', 'rangeData', 'dashUrl', 'durationSecs', 'pickQuality', 'decryptPart', 'requestHeaders', 'rememberReq', 'safeHeaders', 'parseYoutubeCipherUrl', 'norm', 'recordingSource', 'waitRecordMedia', 'waitTracks', 'cleanRecordSource', 'requestBytes', 'partReply', 'ebmlPart', 'ebmlSize', 'webmHead', 'fixWebm', 'recordMime', 'recordSecs', 'mediaExt'];
+const names = ['parseHls', 'ivBytes', 'byteRange', 'rangeData', 'dashUrl', 'durationSecs', 'pickQuality', 'decryptPart', 'requestHeaders', 'rememberReq', 'safeHeaders', 'parseYoutubeCipherUrl', 'norm', 'recordingSource', 'waitRecordMedia', 'waitTracks', 'cleanRecordSource', 'requestBytes', 'partReply', 'ebmlPart', 'ebmlSize', 'webmHead', 'fixWebm', 'recordMime', 'recordSecs', 'mediaExt', 'recordSize', 'clearSaved'];
 const tail = "  installHooks();\n  if (document.readyState === 'loading')";
 assert.ok(source.includes(tail));
 
@@ -15,7 +15,7 @@ function load(fetch, overrides = {}) {
   window.top = window.self = window;
   const context = vm.createContext({ window, document: {}, navigator: {}, location: new URL('https://lesson.test/watch'), matchMedia: () => ({ matches: false }), globalThis: null, URL, URLSearchParams, Blob, TextDecoder, Uint8Array, AbortController, DOMException, crypto: webcrypto, setTimeout, clearTimeout, setInterval, clearInterval, ...overrides });
   context.globalThis = context;
-  vm.runInContext(source.slice(0, source.indexOf(tail)) + `globalThis.api = { ${names.join(',')}, seedFound: (url, meta) => found.set(url, meta) };\n})();`, context);
+  vm.runInContext(source.slice(0, source.indexOf(tail)) + `globalThis.api = { ${names.join(',')}, seedFound: (url, meta) => found.set(url, meta), seedSaved: (url, timer) => saveURLs.set(url, timer) };\n})();`, context);
   return context.api;
 }
 
@@ -273,4 +273,53 @@ test('recordings choose explicit compatible codecs and exclude paused time from 
 test('the detected container overrides a misleading download extension or MIME type', () => {
   assert.equal(api.mediaExt(Uint8Array.of(0x1a,0x45,0xdf,0xa3),'video/mp4'),'webm');
   assert.equal(api.mediaExt(Uint8Array.from(Buffer.from('0000001866747970','hex')),'video/webm'),'mp4');
+});
+
+test('source retries probe a bounded first range and reject large files before continuing', async () => {
+  const calls = [];
+  const small = load(async (url, opts) => {
+    calls.push(opts.headers.Range);
+    const [, a, b] = opts.headers.Range.match(/bytes=(\d+)-(\d+)/);
+    const start = Number(a), end = Math.min(Number(b), 16);
+    return new Response(Uint8Array.from({length:end-start+1}, (_,i)=>start+i), {status:206,headers:{'Content-Range':`bytes ${start}-${end}/17`}});
+  });
+  const result = await small.requestBytes('https://cdn.test/video', {chunkSize:4,limit:20});
+  assert.equal(calls[0], 'bytes=0-3');
+  assert.deepEqual(Buffer.from(result.data), Buffer.from(Array.from({length:17}, (_,i)=>i)));
+  let hits = 0;
+  const large = load(async()=>{hits++;return new Response(new Uint8Array(4), {status:206,headers:{'Content-Range':'bytes 0-3/1000'}});});
+  await assert.rejects(large.requestBytes('https://cdn.test/video', {chunkSize:4,limit:20}), /memory limit/);
+  assert.equal(hits, 1);
+});
+
+test('mobile recording prefers VP8 and keeps portrait and landscape dimensions within 720p', () => {
+  const types = load(undefined, {MediaRecorder:{isTypeSupported:()=>true}});
+  assert.equal(types.recordMime({getVideoTracks:()=>[{}]}, true), 'video/webm;codecs=vp8,opus');
+  assert.equal(types.recordMime({getVideoTracks:()=>[{}]}, false), 'video/mp4;codecs=avc1.42E01E,mp4a.40.2');
+  assert.equal(types.recordMime({getVideoTracks:()=>[]}, true), 'audio/webm;codecs=opus');
+  for (const [w,h,a,b] of [[3840,2160,1280,720],[2160,3840,720,1280],[1080,1080,720,720],[320,180,320,180],[2560,1080,1280,540]]) {
+    const size = api.recordSize(w,h);
+    assert.equal(size.width,a); assert.equal(size.height,b);
+  }
+});
+
+test('starting another job releases the previous download URLs and their cleanup timers', () => {
+  const urls = [], timers = [];
+  const testApi = load(undefined, {URL:{revokeObjectURL:url=>urls.push(url)},clearTimeout:timer=>timers.push(timer)});
+  testApi.seedSaved('blob:one', 1); testApi.seedSaved('blob:two', 2);
+  testApi.clearSaved(); testApi.clearSaved();
+  assert.deepEqual(urls, ['blob:one','blob:two']);
+  assert.deepEqual(timers, [1,2]);
+});
+
+test('mobile recording cleanup releases resized tracks and canvas and resumes only the paused source', () => {
+  let stops = 0, resumed = 0;
+  const track = {removeEventListener(){},stop(){stops++;}};
+  const source = {isConnected:true,play(){resumed++;return Promise.resolve();}};
+  const canvas = {width:1280,height:720};
+  const current = {stream:{getTracks:()=>[track]},sourceStream:{getTracks:()=>[track]},canvas,resumeEl:source};
+  api.cleanRecordSource(current);
+  assert.equal(stops, 1); assert.equal(resumed, 1);
+  assert.equal(canvas.width, 0); assert.equal(canvas.height, 0);
+  assert.equal(current.canvas, null); assert.equal(current.sourceStream, null); assert.equal(current.resumeEl, null);
 });
