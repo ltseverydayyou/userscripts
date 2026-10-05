@@ -6,16 +6,16 @@ const { webcrypto, createCipheriv } = require('node:crypto');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'media finder.user.js'), 'utf8').replace(/\r\n/g, '\n');
-const names = ['parseHls', 'ivBytes', 'byteRange', 'rangeData', 'dashUrl', 'durationSecs', 'pickQuality', 'decryptPart', 'requestHeaders', 'rememberReq', 'safeHeaders', 'parseYoutubeCipherUrl', 'norm'];
+const names = ['parseHls', 'ivBytes', 'byteRange', 'rangeData', 'dashUrl', 'durationSecs', 'pickQuality', 'decryptPart', 'requestHeaders', 'rememberReq', 'safeHeaders', 'parseYoutubeCipherUrl', 'norm', 'recordingSource', 'waitRecordMedia', 'waitTracks', 'cleanRecordSource'];
 const tail = "  installHooks();\n  if (document.readyState === 'loading')";
 assert.ok(source.includes(tail));
 
-function load(fetch) {
+function load(fetch, overrides = {}) {
   const window = { fetch };
   window.top = window.self = window;
-  const context = vm.createContext({ window, document: {}, location: new URL('https://lesson.test/watch'), matchMedia: () => ({ matches: false }), globalThis: null, URL, URLSearchParams, TextDecoder, Uint8Array, AbortController, DOMException, crypto: webcrypto, setTimeout, clearTimeout });
+  const context = vm.createContext({ window, document: {}, navigator: {}, location: new URL('https://lesson.test/watch'), matchMedia: () => ({ matches: false }), globalThis: null, URL, URLSearchParams, TextDecoder, Uint8Array, AbortController, DOMException, crypto: webcrypto, setTimeout, clearTimeout, setInterval, clearInterval, ...overrides });
   context.globalThis = context;
-  vm.runInContext(source.slice(0, source.indexOf(tail)) + `globalThis.api = { ${names.join(',')} };\n})();`, context);
+  vm.runInContext(source.slice(0, source.indexOf(tail)) + `globalThis.api = { ${names.join(',')}, seedFound: (url, meta) => found.set(url, meta) };\n})();`, context);
   return context.api;
 }
 
@@ -127,4 +127,76 @@ test('unresolved YouTube ciphers and unsafe schemes are not usable download URLs
   assert.equal(api.parseYoutubeCipherUrl('url=https%3A%2F%2Fcdn.test%2Fvideo%3Ftoken%3Da%252Fb&sig=ok'), 'https://cdn.test/video?token=a%2Fb&signature=ok');
   assert.equal(api.norm('javascript:alert(1)'), null);
   assert.equal(api.norm('file:///private/file'), null);
+});
+
+test('recording retries use the selected signed file and reject playlists or opaque player sources', () => {
+  const file = 'https://cdn.test/lesson/video?token=a%2Fb&expires=123#time';
+  assert.equal(api.recordingSource({currentSrc:file,src:'https://other.test/other.mp4'}), file);
+  assert.throws(() => api.recordingSource({currentSrc:'blob:https://lesson.test/mse'}), /no directly fetchable/);
+  assert.throws(() => api.recordingSource({currentSrc:'javascript:alert(1)'}), /no directly fetchable/);
+  assert.throws(() => api.recordingSource({currentSrc:base}), /stream playlist/);
+  api.seedFound('https://cdn.test/stream?token=lesson', {mime:'application/dash+xml'});
+  assert.throws(() => api.recordingSource({currentSrc:'https://cdn.test/stream?token=lesson'}), /stream playlist/);
+});
+
+test('a fetched video waits for both decoded media and seeking to finish', async () => {
+  const el = new EventTarget();
+  Object.assign(el, {tagName:'VIDEO',readyState:1,videoWidth:0,seeking:true,error:null});
+  const ctrl = new AbortController();
+  let ready = false;
+  const promise = api.waitRecordMedia(el, ctrl.signal).then(() => { ready = true; });
+  el.readyState = 2;
+  el.dispatchEvent(new Event('loadeddata'));
+  await Promise.resolve();
+  assert.equal(ready, false);
+  el.videoWidth = 320;
+  el.dispatchEvent(new Event('loadeddata'));
+  await Promise.resolve();
+  assert.equal(ready, false);
+  el.seeking = false;
+  el.dispatchEvent(new Event('seeked'));
+  await promise;
+  assert.equal(ready, true);
+});
+
+test('recording setup can be cancelled during local decoding or waiting for capture tracks', async () => {
+  const el = new EventTarget();
+  Object.assign(el, {tagName:'VIDEO',readyState:1,videoWidth:0,seeking:false,error:null});
+  const ctrl = new AbortController();
+  const pending = api.waitRecordMedia(el, ctrl.signal);
+  ctrl.abort();
+  await assert.rejects(pending, {name:'AbortError'});
+  const stream = new EventTarget();
+  stream.getTracks = stream.getVideoTracks = () => [];
+  const tracks = new AbortController();
+  const waiting = api.waitTracks(stream, el, tracks.signal);
+  tracks.abort();
+  await assert.rejects(waiting, {name:'AbortError'});
+  await assert.rejects(api.waitRecordMedia(el, ctrl.signal), {name:'AbortError'});
+});
+
+test('recording cleanup releases its temporary source without changing the original player', () => {
+  const revoked = [];
+  class TestURL extends URL { static revokeObjectURL(url) { revoked.push(url); } }
+  const testApi = load(undefined, {URL:TestURL});
+  const original = {src:'https://cdn.test/original.mp4',paused:false};
+  let stopped = 0;
+  let unloaded = false;
+  let removed = false;
+  const local = new EventTarget();
+  local.pause = () => { local.paused = true; };
+  local.removeAttribute = name => { unloaded = name === 'src'; };
+  local.load = () => {};
+  local.remove = () => { removed = true; };
+  const track = new EventTarget();
+  track.stop = () => { stopped++; };
+  const current = {ctrl:new AbortController(),el:original,localEl:local,localURL:'blob:https://lesson.test/copy',stream:{getTracks:()=>[track]},stop:()=>{}};
+  testApi.cleanRecordSource(current);
+  assert.equal(current.ctrl.signal.aborted, true);
+  assert.equal(stopped, 1);
+  assert.ok(local.paused && unloaded && removed);
+  assert.deepEqual(revoked, ['blob:https://lesson.test/copy']);
+  assert.equal(current.localEl, null);
+  assert.equal(current.localURL, null);
+  assert.deepEqual(original, {src:'https://cdn.test/original.mp4',paused:false});
 });

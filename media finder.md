@@ -2,6 +2,8 @@
 
 Install or update [the userscript](https://github.com/ltseverydayyou/userscripts/raw/main/media%20finder.user.js) in a userscript manager. Version 1.9.0 adds cross-origin request permissions and frame detection, so reinstalling the updated script may be necessary if your manager retains old permissions. Allow the media host when the manager asks.
 
+Version 1.9.1 fixes recording setup stopping immediately on `Cannot capture from element with cross-origin data`. An accessible direct media file now gets a fetch-and-record retry, with cancellable setup and clear instructions when that retry is unavailable.
+
 ## Download
 
 1. Open the page and press play. Media Finder watches player sources, page requests, JSON player data, open shadow roots, and embedded frames where the script can run.
@@ -19,6 +21,12 @@ A live HLS download saves the currently available playlist window. Use recording
 1. Press play, open **Players & recording**, and choose the player. An embedded player is marked **embedded**.
 2. Tap **Record player**. A direct media link is not required. The recording starts at the current playback position and runs while the video plays.
 3. Use **Pause recording**, **Resume recording**, and **Stop & save**. A small stop bar remains available when the main panel closes. Playback ending also saves the recording.
+
+If direct player capture is blocked by cross-origin security, Media Finder tries fetching that player's exact media URL using browser requests and the userscript manager's cross-origin requests. When the file is accessible and playable, it records a muted local copy starting at the playback position when you tapped Record. The status says **Recording fetched copy**. This copy plays independently of the page's player; use Media Finder's recording controls to pause or resume it. The original player's source and cross-origin settings are preserved. The local copy ending also saves the recording.
+
+The full source file must be fetched before this retry can start. **Cancel recording setup** aborts that fetch. To reserve memory for recording, source retries are limited to 128 MiB on touch devices and 384 MiB elsewhere, and their size is counted against the recording memory limit. **Record to file** avoids buffering the recording output, but still requires the source fetch. For larger files, use **Download** or the optional native bridge.
+
+Opaque `blob:` player streams have no directly fetchable file for this retry. HLS/DASH playlists should use **Download**. Expired links, inaccessible files, formats the browser cannot play, and DRM give a clear failure with the available alternatives. Tab / screen capture needs a separate tap and browser sharing selection.
 
 **Record tab / screen** is a separate fallback on browsers that offer display capture. The browser asks which tab, window, or screen to record. Share its audio when offered. Some browsers provide only video; the recording status reports a missing audio track. This option is commonly unavailable on mobile, so its button appears only when the API exists.
 
@@ -40,6 +48,6 @@ Run the core regression tests with Node 20 or newer:
 node --test tests/media-finder.test.cjs
 ```
 
-The update was also tested in a headless browser using local fixtures for encrypted and fragmented HLS, signed queries, ignored byte ranges, redirected playlists, clear DASH audio/video, cancellation, frame/shadow discovery, player and embedded-player recording, and portrait/landscape layout. Saved media was inspected with FFprobe. These fixtures do not establish compatibility with every browser, userscript manager, or teaching-video site.
+The update was also tested in a headless browser using local fixtures for encrypted and fragmented HLS, signed queries, ignored byte ranges, redirected playlists, clear DASH audio/video, cancellation, frame/shadow discovery, player and embedded-player recording, and portrait/landscape layout. A real cross-origin video without CORS reproduced the capture error and then recorded through the source retry, including video and audio. Checks cover fetched-copy pause/resume, playback-end saving, source-fetch cancellation, and temporary-source cleanup. Saved media was inspected with FFprobe. These fixtures do not establish compatibility with every browser, userscript manager, or teaching-video site.
 
 API references: [HLS encryption and playlist format](https://www.rfc-editor.org/rfc/rfc8216), [Tampermonkey requests and permissions](https://www.tampermonkey.net/documentation.php#api:GM_xmlhttpRequest), [media element capture](https://www.w3.org/TR/mediacapture-fromelement/), [MediaRecorder](https://www.w3.org/TR/mediastream-recording/), [display capture](https://www.w3.org/TR/screen-capture/).

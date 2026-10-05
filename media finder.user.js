@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.9.0
+// @version      1.9.1
 // @description  Find and download media, HLS with served AES-128 keys, clear DASH, and record players with mobile-friendly controls
 // @match        *://*/*
 // @run-at       document-start
@@ -116,6 +116,8 @@
   const found = new Map(); // url -> {ts, from:Set, mime?, size?, note?, kind?}
   const pendingItemAnimations = new Set(); // URLs newly detected since the last list render
   const players = new Map(); // el -> {tag, src, last, why:Set}
+  const recordingPlayers = new WeakSet();
+  const recordingBlobs = new WeakSet();
   const srcSeen = new Set();
   const reqInfo = new Map();
   const manifests = new Map();
@@ -1258,6 +1260,7 @@
   }
 
   function trackPlayer(el, why) {
+    if (recordingPlayers.has(el)) return;
     const ttag = el?.tagName?.toLowerCase();
     if (ttag !== 'video' && ttag !== 'audio') return;
 
@@ -1308,6 +1311,7 @@
     try {
       const nodes = domAll('video,audio,img,picture,source,track,link[href],[src],[href],[poster],[srcset],[data-src],[data-href],[data-url],[data-image],[data-img],[data-original],[data-lazy-src],[data-thumb],[data-thumbnail],[data-poster],[data-srcset],style,[style*="url("]');
       nodes.forEach(n => {
+        if (recordingPlayers.has(n)) return;
         const tg = n.tagName?.toLowerCase();
         const baseHint = tagHint(tg);
         if (tg === 'video' || tg === 'audio') trackPlayer(n, 'dom');
@@ -1594,6 +1598,7 @@
     if (!orig) return;
     page.URL.createObjectURL = pageFn(function (value) {
       const url = orig.apply(this, arguments);
+      if (recordingBlobs.has(value)) return url;
       try {
         if (page.MediaSource && value instanceof page.MediaSource || page.ManagedMediaSource && value instanceof page.ManagedMediaSource) {
           add(url, { from: 'mediasource', hintType: 'video', mse: true });
@@ -4150,15 +4155,122 @@
     return choices.find(value => MediaRecorder.isTypeSupported(value)) || '';
   }
 
-  async function waitTracks(stream, el) {
+  async function waitTracks(stream, el, signal) {
+    checkAbort(signal);
     const ready = () => stream.getTracks().some(track => track.readyState === 'live') && (el?.tagName !== 'VIDEO' || stream.getVideoTracks().length > 0);
     if (ready()) return;
     await new Promise((resolve, reject) => {
       const check = () => { if (ready()) { clean(); resolve(); } };
-      const clean = () => { clearTimeout(timer); stream.removeEventListener('addtrack', check); };
+      const clean = () => { clearTimeout(timer); stream.removeEventListener('addtrack', check); signal?.removeEventListener('abort', cancel); };
+      const cancel = () => { clean(); reject(abortError()); };
       const timer = setTimeout(() => { clean(); reject(new Error('The player has no capturable media tracks. Press play first, or use Record tab / screen.')); }, 5000);
       stream.addEventListener('addtrack', check);
+      signal?.addEventListener('abort', cancel, { once: true });
     });
+  }
+
+  function recordingFallbackHint() {
+    return typeof navigator.mediaDevices?.getDisplayMedia === 'function' ? 'Try Record tab / screen and share the tab’s audio, or Download a detected media link.' : 'Use Download on a detected media or playlist. This browser does not offer tab / screen recording.';
+  }
+
+  function recordingSource(el) {
+    const url = norm(getMediaSrc(el));
+    if (!url || !/^https?:/i.test(url) || found.get(url)?.mse) throw new Error('The player has no directly fetchable media file.');
+    const meta = found.get(url) || {};
+    if (guessType(url, meta.mime, meta.kind) === 'playlist') throw new Error('The player uses a stream playlist. Download its HLS / DASH link instead.');
+    return url;
+  }
+
+  function waitRecordMedia(el, signal) {
+    return new Promise((resolve, reject) => {
+      checkAbort(signal);
+      const events = ['loadedmetadata', 'loadeddata', 'canplay', 'seeked', 'error'];
+      const clean = () => {
+        clearTimeout(timer);
+        for (const type of events) el.removeEventListener(type, check);
+        signal.removeEventListener('abort', cancel);
+      };
+      const finish = error => { clean(); error ? reject(error) : resolve(); };
+      const cancel = () => finish(abortError());
+      const check = () => {
+        if (el.error) finish(new Error('The fetched media cannot be played in this browser.'));
+        else if (el.readyState >= 2 && !el.seeking && (el.tagName !== 'VIDEO' || el.videoWidth > 0)) finish();
+      };
+      const timer = setTimeout(() => finish(new Error('The fetched media did not become ready for recording.')), 15000);
+      for (const type of events) el.addEventListener(type, check);
+      signal.addEventListener('abort', cancel, { once: true });
+      check();
+    });
+  }
+
+  async function localRecordingStream(el, current) {
+    const url = recordingSource(el);
+    const position = Math.max(0, Number(el.currentTime) || 0);
+    const rate = Number(el.playbackRate) || 1;
+    const signal = current.ctrl.signal;
+    current.setupStatus = 'Player capture blocked. Fetching an accessible recording source…';
+    renderRecordStatus(current);
+    const result = await requestBytes(url, {
+      signal, base: url, limit: Math.floor(CFG.maxMemoryBytes / 2),
+      progress: (loaded, total) => {
+        if (rec !== current) return;
+        current.setupStatus = `Fetching recording source · ${formatBytes(loaded)}${total ? ' / ' + formatBytes(total) : ''}`;
+        renderRecordStatus(current);
+      }
+    });
+    checkAbort(signal);
+    if (el.mediaKeys || players.get(el)?.protected) throw new Error('The player is DRM protected.');
+    const head = new TextDecoder().decode(result.data.subarray(0, 256));
+    if (/mpegurl|dash\+xml/i.test(result.mime) || /^\s*#EXTM3U|<MPD[\s>]/i.test(head)) {
+      add(url, { from: 'recording:manifest', hintType: 'playlist', mime: result.mime });
+      throw new Error('The media link returned a stream playlist. Download its HLS / DASH link instead.');
+    }
+    if (!result.data.length || /text\/|json|xml/i.test(result.mime) || /^\s*(?:<!doctype|<html|[\[{])/i.test(head)) throw new Error('The media link returned an empty file or a web page.');
+    const blob = new Blob([result.data], { type: /^(video|audio)\//i.test(result.mime) ? result.mime : '' });
+    recordingBlobs.add(blob);
+    current.memoryLimit = CFG.maxMemoryBytes - blob.size;
+    const local = document.createElement(el.tagName.toLowerCase());
+    recordingPlayers.add(local);
+    current.localEl = local;
+    current.localURL = URL.createObjectURL(blob);
+    local.muted = true;
+    local.playsInline = true;
+    local.preload = 'auto';
+    local.style.display = 'none';
+    local.setAttribute('aria-hidden', 'true');
+    local.src = current.localURL;
+    (document.body || document.documentElement).appendChild(local);
+    current.setupStatus = 'Preparing the fetched media for recording…';
+    renderRecordStatus(current);
+    await waitRecordMedia(local, signal);
+    if (position > 0) {
+      local.currentTime = Number.isFinite(local.duration) ? Math.min(position, Math.max(0, local.duration - 0.1)) : position;
+      await waitRecordMedia(local, signal);
+    }
+    if (rate > 0) local.playbackRate = rate;
+    checkAbort(signal);
+    const capture = local.captureStream || local.mozCaptureStream;
+    if (typeof capture !== 'function') throw new Error('This browser cannot capture a locally fetched player.');
+    const stream = capture.call(local);
+    current.stream = stream;
+    await local.play();
+    checkAbort(signal);
+    return stream;
+  }
+
+  function cleanRecordSource(current) {
+    current.ctrl?.abort();
+    clearInterval(current.timer);
+    (current.localEl || current.el)?.removeEventListener('ended', current.stop);
+    for (const track of current.stream?.getTracks?.() || []) { track.removeEventListener('ended', current.stop); track.stop(); }
+    if (current.localEl) {
+      current.localEl.pause();
+      current.localEl.removeAttribute('src');
+      current.localEl.load();
+      current.localEl.remove();
+      current.localEl = null;
+    }
+    if (current.localURL) { URL.revokeObjectURL(current.localURL); current.localURL = null; }
   }
 
   async function startRecord(mode, toFile = false, forcedEl, forcedEntry) {
@@ -4171,6 +4283,8 @@
       if (entry.info.protected) { setStatus('The embedded player is DRM protected. Use the site’s download option.'); return; }
       const frame = entry.frame;
       rec = { remote: frame.source, origin: frame.origin, time: now(), pending: true, paused: false };
+      savedBlob = null;
+      savedFiles = [];
       const current = rec;
       current.timer = setTimeout(() => {
         if (rec === current && !current.started) { sendFrame(current.remote, current.origin, 'stop'); rec = null; setStatus('The embedded player did not start recording. Press play inside it and try again.'); renderCapture(); }
@@ -4185,34 +4299,45 @@
     let stream;
     let writer;
     let handle;
-    const current = { time: now(), chunks: [], size: 0, el: mode === 'player' ? el : null, paused: false, pending: true, writes: Promise.resolve(), finishing: false, reason: '' };
+    const current = { time: now(), ctrl: new AbortController(), chunks: [], size: 0, el: mode === 'player' ? el : null, paused: false, pending: true, setupStatus: 'Starting recording…', writes: Promise.resolve(), finishing: false, reason: '' };
     rec = current;
     savedBlob = null;
     savedFiles = [];
+    renderRecordStatus(current);
+    renderCapture();
     try {
       if (mode === 'tab') {
         if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') throw new Error('Tab / screen recording is unavailable in this browser. On mobile, try Record player.');
         stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
       } else {
         if (el.readyState < 2 || el.tagName === 'VIDEO' && !el.videoWidth) throw new Error('Press play on the video first, then tap Record player.');
-        const capture = el.captureStream || el.mozCaptureStream;
-        if (el.srcObject?.getTracks) stream = new MediaStream(el.srcObject.getTracks().map(track => track.clone()));
-        else if (typeof capture === 'function') stream = capture.call(el);
-        else throw new Error('This browser cannot capture this player directly. Try Record tab / screen if available.');
-        const mime = recordMime(stream);
-        const ext = /mp4/i.test(mime) ? el.tagName === 'AUDIO' ? 'm4a' : 'mp4' : /ogg/i.test(mime) ? 'ogg' : 'webm';
-        const play = el.paused ? el.play() : null;
         if (toFile) {
           if (typeof page.showSaveFilePicker !== 'function') throw new Error('Direct file recording is unavailable in this browser.');
+          const mime = recordMime({ getVideoTracks: () => el.tagName === 'VIDEO' ? [true] : [] });
+          const ext = /mp4/i.test(mime) ? el.tagName === 'AUDIO' ? 'm4a' : 'mp4' : /ogg/i.test(mime) ? 'ogg' : 'webm';
           handle = await page.showSaveFilePicker({ suggestedName: outputName(location.href, ext) });
+          checkAbort(current.ctrl.signal);
         }
-        if (play) await play;
+        const capture = el.captureStream || el.mozCaptureStream;
+        if (el.srcObject?.getTracks) stream = new MediaStream(el.srcObject.getTracks().map(track => track.clone()));
+        else if (typeof capture === 'function') {
+          try { stream = capture.call(el); }
+          catch (error) {
+            if (error.name !== 'SecurityError' && !/cross.origin|insecure|not allowed/i.test(error.message)) throw error;
+            current.captureBlocked = true;
+            stream = await localRecordingStream(el, current);
+          }
+        }
+        else throw new Error('This browser cannot capture this player directly. ' + recordingFallbackHint());
+        current.stream = stream;
+        if (!current.localEl && el.paused) await el.play();
       }
       current.stream = stream;
       if (rec !== current || current.cancelled) throw abortError();
-      await waitTracks(stream, mode === 'player' ? el : null);
+      await waitTracks(stream, mode === 'player' ? current.localEl || el : null, current.ctrl.signal);
       if (rec !== current || current.cancelled) throw abortError();
       if (handle) { writer = await handle.createWritable(); current.writer = writer; }
+      checkAbort(current.ctrl.signal);
       const mime = recordMime(stream);
       const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
       current.recorder = recorder;
@@ -4222,7 +4347,7 @@
       current.time = now();
       current.name = outputName(location.href, 'recording.' + current.ext);
       current.stop = () => stopRecord();
-      if (current.el) current.el.addEventListener('ended', current.stop, { once: true });
+      (current.localEl || current.el)?.addEventListener('ended', current.stop, { once: true });
       for (const track of stream.getTracks()) track.addEventListener('ended', current.stop, { once: true });
       recorder.ondataavailable = event => {
         if (!event.data?.size) return;
@@ -4235,7 +4360,7 @@
           });
         } else {
           current.chunks.push(event.data);
-          if (current.size > CFG.maxMemoryBytes - 8 * 1024 * 1024) stopRecord('The recording reached the memory limit. The recorded part was saved. Use Record to file for longer videos.');
+          if (current.size > (current.memoryLimit || CFG.maxMemoryBytes) - 8 * 1024 * 1024) stopRecord('The recording reached the memory limit. The recorded part was saved. Use Record to file for longer videos.');
         }
       };
       recorder.onerror = event => stopRecord('The recorder failed: ' + (event.error?.message || 'unknown error'));
@@ -4250,19 +4375,22 @@
       renderRecordStatus(current);
       renderCapture();
     } catch (error) {
-      for (const track of stream?.getTracks?.() || []) track.stop();
+      current.stream ||= stream;
+      cleanRecordSource(current);
       if (writer) await writer.abort().catch(() => {});
       if (rec === current) rec = null;
-      const text = error.name === 'AbortError' ? 'Recording cancelled.' : `Recording could not start: ${error.message}`;
-      setStatus(text);
-      if (inFrame) window.top.postMessage({ channel: CHANNEL, type: 'record-result', status: text }, '*');
+      const text = error.name === 'AbortError' ? 'Recording cancelled.' : current.captureBlocked ? `Player capture is blocked by cross-origin security. The local-source retry failed: ${error.message} ${recordingFallbackHint()}` : `Recording could not start: ${error.message}`;
+      if (!rec && !current.reported) {
+        setStatus(text);
+        if (inFrame) window.top.postMessage({ channel: CHANNEL, type: 'record-result', status: text }, '*');
+      }
       renderCapture();
     }
   }
 
   function renderRecordStatus(current) {
     const secs = Math.floor((now() - current.time) / 1000);
-    const label = `${current.paused ? 'Recording paused' : 'Recording'} · ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} · ${formatBytes(current.size || 0)}${current.stream && !current.stream.getAudioTracks().length ? ' · no audio track' : ''}${current.writer ? ' · saving to file' : ''}`;
+    const label = current.pending ? current.setupStatus || 'Starting recording…' : current.remote && current.remoteStatus ? current.remoteStatus : `${current.paused ? 'Recording paused' : current.localEl ? 'Recording fetched copy' : 'Recording'} · ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} · ${formatBytes(current.size || 0)}${current.stream && !current.stream.getAudioTracks().length ? ' · no audio track' : ''}${current.writer ? ' · saving to file' : ''}`;
     setStatus(label);
     if (ui?.recbar) { ui.recbar.hidden = false; ui.recbar.querySelector('span').textContent = label; }
   }
@@ -4270,26 +4398,40 @@
   function stopRecord(reason = '') {
     const current = rec;
     if (!current) return;
-    if (current.remote) { sendFrame(current.remote, current.origin, 'stop'); setStatus('Saving embedded player recording…'); return; }
+    if (current.remote) { sendFrame(current.remote, current.origin, 'stop'); setStatus(current.pending ? 'Cancelling embedded recording setup…' : 'Saving embedded player recording…'); return; }
     if (reason) current.reason = reason;
-    if (current.pending) { current.cancelled = true; rec = null; renderCapture(); return; }
+    if (current.pending) {
+      current.cancelled = true;
+      cleanRecordSource(current);
+      rec = null;
+      current.reported = true;
+      const text = current.reason || 'Recording cancelled.';
+      setStatus(text);
+      if (inFrame) window.top.postMessage({ channel: CHANNEL, type: 'record-result', status: text }, '*');
+      renderCapture();
+      return;
+    }
     if (current.recorder?.state !== 'inactive') current.recorder.stop();
   }
 
   function pauseRecord() {
     if (!rec || rec.pending) return;
     if (rec.remote) { sendFrame(rec.remote, rec.origin, 'pause'); rec.paused = !rec.paused; }
-    else if (rec.recorder.state === 'recording') { rec.recorder.pause(); rec.paused = true; }
-    else if (rec.recorder.state === 'paused') { rec.recorder.resume(); rec.paused = false; }
+    else if (rec.recorder.state === 'recording') { rec.recorder.pause(); rec.localEl?.pause(); rec.paused = true; }
+    else if (rec.recorder.state === 'paused') {
+      const current = rec;
+      current.recorder.resume();
+      current.paused = false;
+      current.localEl?.play().catch(error => { if (rec === current) stopRecord('The fetched media could not resume: ' + error.message); });
+    }
+    if (!rec.remote) renderRecordStatus(rec);
     renderCapture();
   }
 
   async function finishRecord(current) {
     if (current.finishing) return;
     current.finishing = true;
-    clearInterval(current.timer);
-    current.el?.removeEventListener('ended', current.stop);
-    for (const track of current.stream?.getTracks?.() || []) { track.removeEventListener('ended', current.stop); track.stop(); }
+    cleanRecordSource(current);
     let blob = null;
     let text;
     try {
@@ -4563,7 +4705,7 @@
       try {
         const items = Array.from(found).slice(-500).map(([url, meta]) => ({ url, mime: meta.mime, size: meta.size, note: meta.note, kind: meta.kind, mse: !!meta.mse }));
         const list = Array.from(players).filter(([el]) => el.isConnected).map(([el, info]) => ({ id: info.id, tag: info.tag, src: info.src, protected: info.protected, paused: el.paused }));
-        window.top.postMessage({ channel: CHANNEL, type: 'snapshot', page: location.href, items, players: list, recording: !!rec, status: statusText }, '*');
+        window.top.postMessage({ channel: CHANNEL, type: 'snapshot', page: location.href, items, players: list, recording: !!rec, pending: !!rec?.pending, paused: !!rec?.paused, status: statusText }, '*');
       } catch {}
     }, 500);
   }
@@ -4614,7 +4756,14 @@
           add(url, { from: 'frame:' + event.origin, mime: String(item.mime || '').slice(0, 200), hintType: normalizeType(item.kind), note: String(item.note || '').slice(0, 200), size: Math.max(0, Number(item.size) || 0), referrer: info.page, frame: info.id, mse: !!item.mse });
         }
         if (rec?.remote === event.source) {
-          if (msg.recording) { rec.started = true; rec.pending = false; }
+          if (msg.recording) {
+            clearTimeout(rec.timer);
+            if (msg.pending !== true && !rec.started) { rec.started = true; rec.time = now(); }
+            rec.pending = msg.pending === true;
+            rec.paused = msg.paused === true;
+            rec.setupStatus = String(msg.status || 'Starting embedded recording…').slice(0, 500);
+            rec.remoteStatus = rec.setupStatus;
+          }
           else if (rec.pending && now() - rec.time > 2000 && msg.status) { rec = null; setStatus(String(msg.status).slice(0, 500)); }
           else if (msg.status && rec.started) setStatus(String(msg.status).slice(0, 500));
         }
@@ -4688,9 +4837,11 @@
     ui.recordfile.hidden = typeof page.showSaveFilePicker !== 'function' || !!selected?.frame;
     ui.recordfile.disabled = ui.record.disabled;
     ui.stop.hidden = !rec;
+    ui.stop.textContent = rec?.pending ? 'Cancel recording setup' : 'Stop & save';
     ui.pause.hidden = !rec || !!rec.pending;
     ui.pause.textContent = rec?.paused ? 'Resume recording' : 'Pause recording';
     ui.recbar.hidden = !rec;
+    ui.recbar.querySelector('button').textContent = rec?.pending ? 'Cancel' : 'Stop & save';
     if (rec?.remote) renderRecordStatus(rec);
     if (ui.cancel) ui.cancel.hidden = !job;
     if (ui.save) ui.save.hidden = !savedBlob;
