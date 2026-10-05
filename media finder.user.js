@@ -1,18 +1,19 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.8.2
-// @description  Advanced media finder for images/audio/video/m3u8/mpd with deeper DOM/script probing, extractor-page detection, and richer download UX
+// @version      1.9.0
+// @description  Find and download media, HLS with served AES-128 keys, clear DASH, and record players with mobile-friendly controls
 // @match        *://*/*
-// @noframes
 // @run-at       document-start
 // @grant        GM_openInTab
 // @grant        GM_download
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      127.0.0.1
 // @connect      localhost
+// @connect      *
 // @downloadURL  https://github.com/ltseverydayyou/userscripts/raw/main/media%20finder.user.js
 // @updateURL    https://github.com/ltseverydayyou/userscripts/raw/main/media%20finder.meta.js
 // ==/UserScript==
@@ -20,7 +21,9 @@
 (function () {
   'use strict';
 
-  if (window.top !== window.self) return;
+  const inFrame = window.top !== window.self;
+  const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const rawFetch = window.fetch?.bind(window);
 
   const INSTANCE_KEY = '__media_finder_singleton__';
   if (globalThis[INSTANCE_KEY]) return;
@@ -50,7 +53,9 @@
     includeQueryExt: true,
     bridgeUrl: 'http://127.0.0.1:38491',
     bridgeTimeoutMs: 30000,
-    bridgeRetryMs: 30000
+    bridgeRetryMs: 30000,
+    maxParts: 20000,
+    maxMemoryBytes: matchMedia('(pointer: coarse)').matches ? 256 * 1024 * 1024 : 768 * 1024 * 1024
   };
 
   const EXT = [
@@ -112,6 +117,22 @@
   const pendingItemAnimations = new Set(); // URLs newly detected since the last list render
   const players = new Map(); // el -> {tag, src, last, why:Set}
   const srcSeen = new Set();
+  const reqInfo = new Map();
+  const manifests = new Map();
+  const frameInfo = new Map();
+  const roots = new Set([document]);
+  const watched = new WeakSet();
+  const CHANNEL = 'media-finder-v190';
+  let playerSeq = 0;
+  let relayTimer = null;
+  let job = null;
+  let rec = null;
+  let savedBlob = null;
+  let savedFiles = [];
+  let foundRev = 0;
+  let listSig = '';
+  let statusText = '';
+  let quality = 0;
 
   let ui = null;
   let uiOpen = false;
@@ -160,7 +181,7 @@
       uniqueFirst: 'Unique first',
       export: 'Export .txt',
       openList: 'Open list',
-      tip: 'Tip: scroll/load more and press play. This tracker captures images, audio, video, HLS and DASH links.',
+      tip: 'Press play or scroll to find media. Use recording if there is no usable link.',
       noneYet: 'No media links yet. Scroll/load content or press play, then wait a second.',
       clipboardBlocked: 'Clipboard blocked — use Open list',
       copied: 'Copied',
@@ -520,7 +541,7 @@
     } catch { }
 
     try {
-      const nodes = document.querySelectorAll('video,audio,img,picture,source,track,link[href],[src],[href],[poster],[srcset],[data-src],[data-href],[data-url],[data-image],[data-img],[data-original],[data-lazy-src],[data-thumb],[data-thumbnail],[data-poster],[data-srcset],style,[style*="url("]');
+      const nodes = domAll('video,audio,img,picture,source,track,link[href],[src],[href],[poster],[srcset],[data-src],[data-href],[data-url],[data-image],[data-img],[data-original],[data-lazy-src],[data-thumb],[data-thumbnail],[data-poster],[data-srcset],style,[style*="url("]');
       nodes.forEach(n => {
         const tg = n.tagName?.toLowerCase?.() || '';
         if (tg === 'video' || tg === 'audio' || tg === 'img') {
@@ -567,7 +588,11 @@
     if (!/^https?:|^blob:|^data:/i.test(u)) {
       try { u = new URL(u, location.href).href; } catch { return null; }
     }
-    return u;
+    try {
+      const parsed = new URL(u, location.href);
+      if (!['http:', 'https:', 'blob:', 'data:'].includes(parsed.protocol)) return null;
+      return parsed.href;
+    } catch { return null; }
   }
 
   function looksLikeMedia(u) {
@@ -655,32 +680,25 @@
   }
 
   function walkObjectForUrls(node, from, keyHint, depth) {
-    if (depth > CFG.maxJsonWalkDepth || node == null) return;
-
-    if (typeof node === 'string') {
-      const text = node.trim();
-      if (!text) return;
-      const hasHint = !!keyHint;
-      if (
-        /^https?:\/\//i.test(text) ||
-        /^\/\//.test(text) ||
-        (hasHint && /^\/[^/]/.test(text)) ||
-        looksLikeMedia(text)
-      ) {
-        add(text, { from, hintType: keyHint || '' });
-      }
-      return;
-    }
-
-    if (Array.isArray(node)) {
-      for (const it of node) walkObjectForUrls(it, from, keyHint, depth + 1);
-      return;
-    }
-
-    if (typeof node === 'object') {
-      for (const [k, v] of Object.entries(node)) {
-        const nextHint = hintFromKey(k) || keyHint || '';
-        walkObjectForUrls(v, from, nextHint, depth + 1);
+    const stack = [{ node, hint: keyHint || '', depth: depth || 0 }];
+    const seen = new WeakSet();
+    let visits = 0;
+    while (stack.length && visits++ < 10000) {
+      const item = stack.pop();
+      const value = item.node;
+      if (item.depth > CFG.maxJsonWalkDepth || value == null) continue;
+      if (typeof value === 'string') {
+        const text = value.trim().replace(/\\u0026/gi, '&').replace(/\\u003d/gi, '=').replace(/\\\//g, '/');
+        if (text.length > 16000) continue;
+        if (/^https?:\/\/|^\/\//i.test(text) || item.hint && /^\/[^/]/.test(text) || looksLikeMedia(text)) add(text, { from, hintType: item.hint });
+      } else if (typeof value === 'object' && !seen.has(value)) {
+        seen.add(value);
+        try {
+          for (const key of Object.keys(value).slice(0, 2000)) {
+            if (stack.length >= 10000) break;
+            stack.push({ node: value[key], hint: hintFromKey(key) || item.hint, depth: item.depth + 1 });
+          }
+        } catch {}
       }
     }
   }
@@ -690,7 +708,7 @@
       const qs = new URLSearchParams(String(cipher || ''));
       let u = qs.get('url') || '';
       if (!u) return '';
-      u = safeDecode(u);
+      if (qs.get('s') && !qs.get('sig') && !qs.get('signature')) return '';
       const sp = qs.get('sp') || 'signature';
       const sig = qs.get('sig') || qs.get('signature') || '';
       if (sig) {
@@ -898,6 +916,8 @@
           from: 'yt-dlp:format',
           size,
           note,
+          headers: fmt.http_headers || metadata.http_headers,
+          referrer: pageUrl || location.href,
           hintType: type || ''
         });
       }
@@ -906,6 +926,8 @@
           from: 'yt-dlp:manifest',
           size,
           note,
+          headers: fmt.http_headers || metadata.http_headers,
+          referrer: pageUrl || location.href,
           hintType: 'playlist'
         });
       }
@@ -1025,7 +1047,9 @@
       tsSeen.add(key);
     }
 
+    let changed = false;
     if (!found.has(u)) {
+      changed = true;
       if (found.size >= CFG.maxItems) return;
       found.set(u, { ts: now(), from: new Set(), mime: mime || '', size: meta?.size || 0, note: meta?.note || (tsSeg ? 'segment' : ''), kind: hint || '' });
       pendingItemAnimations.add(u);
@@ -1033,24 +1057,31 @@
 
     const it = found.get(u);
     if (meta?.from) {
+      if (!it.from.has(meta.from)) changed = true;
       it.from.add(meta.from);
       if (it.from.size > CFG.maxReasons) {
         const arr = Array.from(it.from).slice(-CFG.maxReasons);
         it.from = new Set(arr);
       }
     }
-    if (mime && !it.mime) it.mime = mime;
-    if (meta?.size && !it.size) it.size = meta.size;
-    if (meta?.note && !it.note) it.note = meta.note;
-    if (hint && !it.kind) it.kind = hint;
+    if (mime && !it.mime) { it.mime = mime; changed = true; }
+    if (meta?.size && !it.size) { it.size = meta.size; changed = true; }
+    if (meta?.note && !it.note) { it.note = meta.note; changed = true; }
+    if (hint && !it.kind) { it.kind = hint; changed = true; }
 
+    if (meta?.referrer) it.referrer = meta.referrer;
+    if (meta?.headers) it.headers = safeHeaders(meta.headers);
+    if (meta?.frame) it.frame = meta.frame;
+    if (meta?.mse && !it.mse) { it.mse = true; it.note = 'Player stream — use recording'; changed = true; }
+    if (!changed) return;
+    foundRev++;
     scheduleRender();
     maybeToast();
   }
 
   function scanMetaTags() {
     try {
-      const nodes = document.querySelectorAll('meta[property],meta[name],meta[itemprop]');
+      const nodes = domAll('meta[property],meta[name],meta[itemprop]');
       nodes.forEach(m => {
         const content = m.getAttribute('content') || '';
         if (!content) return;
@@ -1064,7 +1095,7 @@
 
   function scanJsonLd() {
     try {
-      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      const scripts = domAll('script[type="application/ld+json"]');
       scripts.forEach(s => {
         const txt = s.textContent || '';
         if (!txt) return;
@@ -1080,7 +1111,7 @@
 
   function scanInlineScriptsForMediaUrls() {
     try {
-      const scripts = document.querySelectorAll('script:not([src])');
+      const scripts = domAll('script:not([src])');
       let scanned = 0;
       for (const s of scripts) {
         if (scanned >= CFG.maxScriptTagsPerScan) break;
@@ -1119,18 +1150,18 @@
 
   function getYoutubePlayerResponse() {
     try {
-      const a = window.ytInitialPlayerResponse;
+      const a = page.ytInitialPlayerResponse;
       if (a && typeof a === 'object') return a;
     } catch { }
     try {
-      const b = window.ytplayer?.config?.args?.player_response;
+      const b = page.ytplayer?.config?.args?.player_response;
       if (b) {
         const parsed = typeof b === 'string' ? safeJsonParse(b) : b;
         if (parsed && typeof parsed === 'object') return parsed;
       }
     } catch { }
     try {
-      const c = window.ytcfg?.data_?.PLAYER_RESPONSE;
+      const c = page.ytcfg?.data_?.PLAYER_RESPONSE;
       if (c && typeof c === 'object') return c;
     } catch { }
     return null;
@@ -1236,10 +1267,16 @@
     let info = players.get(el);
     if (!info) {
       if (players.size >= CFG.maxPlayers) return;
-      info = { tag: ttag, why: new Set(), src: '', last: 0 };
+      info = { id: 'p' + (++playerSeq), tag: ttag, why: new Set(), src: '', last: 0, protected: !!el.mediaKeys };
+      el.addEventListener('encrypted', () => {
+        info.protected = true;
+        if (rec?.el === el) stopRecord('The player uses DRM. Recording was stopped.');
+        scheduleRender();
+      });
       players.set(el, info);
     }
 
+    info.protected = info.protected || !!el.mediaKeys;
     if (why) info.why.add(why);
     if (info.why.size > CFG.maxReasons) info.why = new Set(Array.from(info.why).slice(-CFG.maxReasons));
 
@@ -1249,7 +1286,7 @@
 
       if (!srcSeen.has(src)) {
         srcSeen.add(src);
-        add(src, { from: 'player:' + ttag });
+        add(src, { from: 'player:' + ttag, hintType: ttag });
       }
     }
 
@@ -1269,7 +1306,7 @@
 
   function scanDom() {
     try {
-      const nodes = document.querySelectorAll('video,audio,img,picture,source,track,link[href],[src],[href],[poster],[srcset],[data-src],[data-href],[data-url],[data-image],[data-img],[data-original],[data-lazy-src],[data-thumb],[data-thumbnail],[data-poster],[data-srcset],style,[style*="url("]');
+      const nodes = domAll('video,audio,img,picture,source,track,link[href],[src],[href],[poster],[srcset],[data-src],[data-href],[data-url],[data-image],[data-img],[data-original],[data-lazy-src],[data-thumb],[data-thumbnail],[data-poster],[data-srcset],style,[style*="url("]');
       nodes.forEach(n => {
         const tg = n.tagName?.toLowerCase();
         const baseHint = tagHint(tg);
@@ -1323,6 +1360,7 @@
       });
     } catch { }
 
+    scanPlayerApis();
     runDeepExtractors();
   }
 
@@ -1364,6 +1402,7 @@
       const hasMpd = /<MPD[\s>]/i.test(body);
       if (!hasM3u && !hasMpd) return;
 
+      cacheManifest(url, body);
       add(url, { from: from || 'sniff:playlist', mime: mime, note: 'playlist', hintType: 'playlist' });
       const base = new URL(url, location.href);
 
@@ -1374,7 +1413,7 @@
           if (/^data:/i.test(ln)) continue;
           let abs = null;
           try { abs = new URL(ln, base.href).href; } catch { abs = null; }
-          if (abs) add(abs, { from: 'playlist:child', hintType: 'video' });
+          if (abs) add(abs, { from: 'playlist:child', hintType: /\.m3u8(?:$|[?#])/i.test(abs) ? 'playlist' : 'video' });
         }
       }
 
@@ -1383,7 +1422,7 @@
         let m;
         while ((m = re.exec(body))) {
           const raw = m[1];
-          if (!raw || /^data:/i.test(raw)) continue;
+          if (!raw || /^data:/i.test(raw) || /\$[^$]+\$/.test(raw)) continue;
           let abs = null;
           try { abs = new URL(raw, base.href).href; } catch { abs = null; }
           if (abs) add(abs, { from: 'playlist:child', hintType: 'video' });
@@ -1403,104 +1442,190 @@
       if (len && len > CFG.maxFetchBodyBytesForPlaylist) return;
       if (!looksText) return;
 
-      const txt = await resp.clone().text();
+      const txt = await smallText(resp);
       if (!txt) return;
       sniffPlaylistText(url, mime, txt, 'sniff:playlist');
     } catch { }
   }
 
+  function pageFn(fn) {
+    try { return typeof exportFunction === 'function' ? exportFunction(fn, page) : fn; }
+    catch { return fn; }
+  }
+
+  function safeHeaders(headers) {
+    const out = {};
+    try {
+      const pairs = typeof headers?.entries === 'function' ? Array.from(headers.entries()) : Array.isArray(headers) ? headers : Object.entries(headers || {});
+      for (const [key, value] of pairs) {
+        if (/^(accept|authorization|range|x-[\w-]+)$/i.test(key) && !/[\r\n]/.test(String(value))) out[key] = String(value);
+      }
+    } catch {}
+    return out;
+  }
+
+  function rememberReq(url, headers) {
+    const u = norm(url);
+    if (!u || !/^https?:/i.test(u)) return;
+    reqInfo.delete(u);
+    reqInfo.set(u, { headers: safeHeaders(headers), referrer: location.href });
+    if (reqInfo.size > 500) reqInfo.delete(reqInfo.keys().next().value);
+  }
+
+  function cacheManifest(url, text) {
+    manifests.delete(url);
+    manifests.set(url, { text, time: now() });
+    if (manifests.size > 24) manifests.delete(manifests.keys().next().value);
+  }
+
+  async function smallText(resp) {
+    const copy = resp.clone();
+    const limit = CFG.maxFetchBodyBytesForPlaylist;
+    if (!copy.body?.getReader) {
+      const text = await copy.text();
+      return text.length <= limit ? text : '';
+    }
+    const reader = copy.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        size += part.value.byteLength;
+        if (size > limit) { reader.cancel().catch(() => {}); return ''; }
+        chunks.push(part.value);
+      }
+      const bytes = new Uint8Array(size);
+      let at = 0;
+      for (const chunk of chunks) { bytes.set(chunk, at); at += chunk.byteLength; }
+      return new TextDecoder().decode(bytes);
+    } catch { return ''; }
+    finally { reader.releaseLock(); }
+  }
+
+  async function sniffResponse(url, mime, resp) {
+    if (!resp.ok) return;
+    const textLike = /json|xml|mpegurl|text\/plain/i.test(mime) || /\.(m3u8|mpd)(?:$|[?#])/i.test(url);
+    if (!textLike) return;
+    if (Number(readHeader(resp.headers, 'content-length')) > CFG.maxFetchBodyBytesForPlaylist) return;
+    const text = await smallText(resp);
+    if (!text) return;
+    if (/^\s*#EXTM3U|<MPD[\s>]/i.test(text)) sniffPlaylistText(url, mime, text, 'network:manifest');
+    else if (/^\s*[\[{]/.test(text)) walkObjectForUrls(safeJsonParse(text), 'network:json', '', 0);
+  }
+
   function patchFetch() {
-    if (!window.fetch) return;
-    const orig = window.fetch;
-    window.fetch = function (...args) {
+    const orig = page.fetch;
+    if (!orig) return;
+    page.fetch = pageFn(function (...args) {
       let url = '';
       try {
-        const a0 = args[0];
-        url = typeof a0 === 'string' ? a0 : (a0 && a0.url) || '';
-      } catch { }
-      const nurl = norm(url) || url;
-
-      return orig.apply(this, args).then(async (resp) => {
+        url = norm(typeof args[0] === 'string' || args[0] instanceof URL ? String(args[0]) : args[0]?.url) || '';
+        rememberReq(url, args[1]?.headers || args[0]?.headers);
+      } catch {}
+      const result = orig.apply(this, args);
+      result.then(resp => {
         try {
           const ct = readHeader(resp.headers, 'content-type');
           const len = Number(readHeader(resp.headers, 'content-length')) || 0;
-          const furl = norm(resp?.url) || resp?.url || '';
-          const purl = furl || nurl;
-
-          if (nurl) add(nurl, { from: 'fetch', mime: ct, size: len });
-          if (furl && furl !== nurl) add(furl, { from: 'fetch:final', mime: ct, size: len });
-          if (purl) await sniffMaybePlaylist(purl, ct, resp);
-        } catch { }
-        return resp;
-      });
-    };
+          const target = resp.url || url;
+          if (url) add(url, { from: 'fetch', mime: ct, size: len });
+          if (target !== url) {
+            rememberReq(target, new URL(target).origin === new URL(url).origin ? reqInfo.get(url)?.headers : {});
+            add(target, { from: 'fetch:final', mime: ct, size: len });
+          }
+          sniffResponse(target, ct, resp).catch(() => {});
+        } catch {}
+      }, () => {});
+      return result;
+    });
   }
 
   function patchXHR() {
-    const X = window.XMLHttpRequest;
-    if (!X) return;
-
-    const open0 = X.prototype.open;
-    const send0 = X.prototype.send;
-
-    X.prototype.open = function (method, url) {
-      try { this.__mf_url = norm(url) || url || ''; } catch { }
-      try { this.__mf_method = method || ''; } catch { }
+    const proto = page.XMLHttpRequest?.prototype;
+    if (!proto) return;
+    const open0 = proto.open;
+    const send0 = proto.send;
+    const set0 = proto.setRequestHeader;
+    const data = new WeakMap();
+    proto.open = pageFn(function (method, url) {
+      const old = data.get(this);
+      if (old?.done) this.removeEventListener('loadend', old.done);
+      data.set(this, { url: norm(url), headers: {}, method: String(method || '') });
       return open0.apply(this, arguments);
-    };
-
-    X.prototype.send = function () {
-      try {
-        const onReady = () => {
+    });
+    proto.setRequestHeader = pageFn(function (key, value) {
+      const info = data.get(this);
+      if (info) Object.assign(info.headers, safeHeaders({ [key]: value }));
+      return set0.apply(this, arguments);
+    });
+    proto.send = pageFn(function () {
+      const info = data.get(this);
+      if (info) {
+        rememberReq(info.url, info.headers);
+        info.done = () => {
           try {
-            if (this.readyState !== 4) return;
-            this.removeEventListener('readystatechange', onReady);
-            const u = this.__mf_url || '';
-            const ru = norm(this.responseURL) || this.responseURL || '';
-            const target = ru || u;
-            if (!target) return;
-
-            let ct = '';
-            try { ct = this.getResponseHeader('content-type') || ''; } catch { }
-            let len = 0;
-            try { len = Number(this.getResponseHeader('content-length')) || 0; } catch { }
-
-            add(target, { from: 'xhr', mime: ct, size: len });
-            if (u && u !== target) add(u, { from: 'xhr:open', mime: ct, size: len });
-
-            const rt = String(this.responseType || '');
-            if ((rt === '' || rt === 'text') && ct && (ct.includes('mpegurl') || ct.includes('dash+xml') || ct.includes('xml') || ct.includes('text'))) {
-              let txt = '';
-              try { txt = String(this.responseText || ''); } catch { txt = ''; }
-              if (txt && txt.length <= CFG.maxFetchBodyBytesForPlaylist) sniffPlaylistText(target, ct, txt, 'xhr:playlist');
+            const target = this.responseURL || info.url;
+            const ct = this.getResponseHeader('content-type') || '';
+            rememberReq(target, info.headers);
+            add(target, { from: 'xhr', mime: ct, size: Number(this.getResponseHeader('content-length')) || 0 });
+            if (this.responseType === 'json') walkObjectForUrls(this.response, 'xhr:json', '', 0);
+            else if ((!this.responseType || this.responseType === 'text') && /json|xml|mpegurl|text\/plain/i.test(ct)) {
+              const text = this.responseText || '';
+              if (text.length <= CFG.maxFetchBodyBytesForPlaylist) {
+                sniffPlaylistText(target, ct, text, 'xhr:manifest');
+                if (/^\s*[\[{]/.test(text)) walkObjectForUrls(safeJsonParse(text), 'xhr:json', '', 0);
+              }
+            } else if (this.responseType === 'arraybuffer' && /mpegurl|dash\+xml/i.test(ct) && this.response?.byteLength <= CFG.maxFetchBodyBytesForPlaylist) {
+              sniffPlaylistText(target, ct, new TextDecoder().decode(this.response), 'xhr:manifest');
             }
-          } catch { }
+          } catch {}
+          info.done = null;
         };
-
-        this.addEventListener('readystatechange', onReady);
-      } catch { }
+        this.addEventListener('loadend', info.done, { once: true });
+      }
       return send0.apply(this, arguments);
-    };
+    });
   }
 
   function patchMediaSource() {
-    const MS = window.MediaSource;
-    if (!MS || !MS.prototype) return;
-
-    const addSB0 = MS.prototype.addSourceBuffer;
-    MS.prototype.addSourceBuffer = function (mime) {
+    const orig = page.URL?.createObjectURL;
+    if (!orig) return;
+    page.URL.createObjectURL = pageFn(function (value) {
+      const url = orig.apply(this, arguments);
       try {
-        if (mime && (String(mime).includes('audio') || String(mime).includes('video') || String(mime).includes('mp4') || String(mime).includes('webm'))) {
-          add(location.href, { from: 'mediasource', mime: String(mime), note: 'MSE stream (segments)' });
+        if (page.MediaSource && value instanceof page.MediaSource || page.ManagedMediaSource && value instanceof page.ManagedMediaSource) {
+          add(url, { from: 'mediasource', hintType: 'video', mse: true });
+        } else if (value?.size && /^(video|audio|image)\//i.test(value.type || '')) {
+          add(url, { from: 'blob', hintType: value.type.split('/')[0], mime: value.type, size: value.size });
         }
-      } catch { }
-      return addSB0.apply(this, arguments);
-    };
+      } catch {}
+      return url;
+    });
+  }
+
+  function scanPlayerApis() {
+    try {
+      const vars = ['__NEXT_DATA__', '__INITIAL_STATE__', '__PLAYER_CONFIG__', 'playerConfig'];
+      for (const key of vars) {
+        const val = page[key];
+        if (val && typeof val === 'object') walkObjectForUrls(val, 'player:config', '', 0);
+      }
+      if (typeof page.jwplayer === 'function') {
+        const list = page.jwplayer()?.getPlaylist?.();
+        if (list) walkObjectForUrls(list, 'player:jwplayer', 'video', 0);
+      }
+      for (const item of page.videojs?.getAllPlayers?.() || []) {
+        for (const src of item.currentSources?.() || []) add(src.src, { from: 'player:videojs', mime: src.type, hintType: 'video' });
+      }
+    } catch {}
   }
 
   function patchSetSrcAttr() {
-    const setAttr0 = Element.prototype.setAttribute;
-    Element.prototype.setAttribute = function (name, value) {
+    const proto = page.Element.prototype;
+    const setAttr0 = proto.setAttribute;
+    proto.setAttribute = pageFn(function (name, value) {
       try {
         const n = String(name || '').toLowerCase();
         const tag = this?.tagName?.toLowerCase?.() || '';
@@ -1519,11 +1644,11 @@
         }
       } catch { }
       return setAttr0.apply(this, arguments);
-    };
+    });
   }
 
   function ensureUI() {
-    if (ui) return;
+    if (inFrame || ui) return;
 
     const root = document.createElement('div');
     root.id = '__mf_root__';
@@ -2538,6 +2663,97 @@
         .mf_row { grid-template-columns: 1fr; }
         .mf_customizer.mf_open { max-height: 860px; }
       }
+      [hidden] { display: none !important; }
+      .mf_panel, .mf_main, .mf_body, .mf_listwrap { min-width: 0; min-height: 0; }
+      .mf_body { overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+      .mf_status {
+        flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+        padding: 10px 12px; max-height: 130px; overflow-y: auto;
+        color: var(--mf-text); background: var(--mf-surface-strong);
+        border-bottom: 1px solid var(--mf-border); font: 13px system-ui, sans-serif;
+      }
+      .mf_status span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+      .mf_status button { flex-shrink: 0; }
+      .mf_status select { max-width: min(260px, 100%); min-width: 0; }
+      .mf_capture, .mf_tip, .mf_listwrap { flex-shrink: 0; }
+      .mf_capture { border: 1px solid var(--mf-border); border-radius: 8px; padding: 10px; margin-bottom: 10px; background: var(--mf-surface); font: 13px system-ui, sans-serif; }
+      .mf_capture summary { cursor: pointer; min-height: 28px; }
+      .mf_capturecontrols { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding-top: 8px; }
+      .mf_capturecontrols select { max-width: 100%; min-width: 0; }
+      .mf_capturecontrols > select { flex: 1 1 100%; width: 100%; }
+      .mf_capturecontrols label { display: flex; align-items: center; gap: 8px; }
+      .mf_capture p { color: var(--mf-text-soft); line-height: 1.5; margin-bottom: 0; }
+      .mf_recbar {
+        position: fixed; bottom: max(12px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
+        z-index: 2147483647; width: max-content; max-width: calc(100vw - 16px); border: 1px solid var(--mf-border-strong);
+        border-radius: 8px; background: var(--mf-bg-strong); color: var(--mf-text); padding: 8px;
+        display: flex; gap: 10px; align-items: center; box-shadow: var(--mf-shadow); font: 13px system-ui, sans-serif;
+      }
+      .mf_recbar span { min-width: 0; overflow-wrap: anywhere; }
+      .mf_url, .mf_meta { overflow-wrap: anywhere; }
+      @media (max-width: 950px), (pointer: coarse) {
+        .mf_backdrop {
+          inset: auto; top: var(--mf-view-top, 0px); left: var(--mf-view-left, 0px);
+          width: var(--mf-view-width, 100vw); height: var(--mf-view-height, 100dvh);
+          padding: max(6px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
+          overflow: hidden; align-items: stretch;
+        }
+        .mf_stage, :host([data-dock-side="left"]) .mf_stage { position: relative; flex-direction: column; width: 100%; height: 100%; gap: 0; margin: 0; }
+        .mf_panel { width: 100%; max-width: none; height: 100%; flex: 1; border-radius: 10px; }
+        .mf_hdr { padding: 8px; gap: 6px; flex-shrink: 0; }
+        .mf_hdrmain { width: 100%; flex: 1; gap: 8px; }
+        .mf_sp { display: none; }
+        .mf_headeractions #__mf_customize__ { order: -1; }
+        .mf_brandlink { width: 32px; height: 32px; border-radius: 6px; }
+        .mf_titlebar { gap: 4px; flex-wrap: wrap; }
+        .mf_title { font-size: 14px; }
+        .mf_owner { font-size: 11px; }
+        .mf_headeractions { display: flex; flex-wrap: nowrap; width: 100%; overflow-x: auto; gap: 6px; justify-content: flex-start; scrollbar-width: thin; }
+        .mf_headeractions .mf_iconbtn { flex: 0 0 auto; white-space: nowrap; }
+        .mf_headeractions .mf_closebtn { position: sticky; right: 0; margin-left: auto; background: var(--mf-bg-strong); }
+        .mf_row { flex-shrink: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 8px; gap: 6px; }
+        .mf_row .mf_inp { grid-column: 1 / -1; width: 100%; min-width: 0; }
+        .mf_row .mf_iconbtn { min-width: 0; font-size: 11px; padding: 6px; }
+        .mf_row .mf_sel { width: 100%; min-width: 0; }
+        .mf_iconbtn, .mf_sel, .mf_inp, .mf_actions button { min-height: 44px; border-radius: 6px; touch-action: manipulation; }
+        .mf_inp { font-size: 16px; }
+        .mf_body { flex: 1; padding: 8px; }
+        .mf_item { flex-direction: column; gap: 8px; padding: 10px; border-radius: 8px; }
+        .mf_listwrap.mf_grid { grid-template-columns: minmax(0, 1fr); }
+        .mf_main { width: 100%; }
+        .mf_actions { width: 100%; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+        .mf_actions button { width: 100%; min-width: 0; flex: none; padding: 6px; }
+        .mf_url { font-size: 12px; white-space: normal; word-break: break-word; }
+        .mf_customizer.mf_open { max-height: min(30dvh, 260px); overflow-y: auto; flex-shrink: 0; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 6px 8px; padding: 8px; }
+        .mf_customizer .mf_sel { width: 100%; min-width: 0; }
+        .mf_previewdock.mf_open {
+          position: absolute; inset: 0; z-index: 5; width: 100%; max-width: 100%; min-height: 0;
+          height: 100%; max-height: 100%; flex-basis: auto; border-radius: 10px; transform: none;
+        }
+        .mf_stage:has(.mf_previewdock.mf_open) .mf_panel { visibility: hidden; }
+        .mf_previewdock_body { min-height: 0; overflow-y: auto; }
+        .mf_preview_player video, .mf_preview_player img { max-height: min(48dvh, 400px); }
+        .mf_capturecontrols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .mf_capturecontrols > select, .mf_capturecontrols label { grid-column: 1 / -1; }
+        .mf_capturecontrols button { padding: 6px; min-width: 0; }
+        .mf_capturecontrols label select { flex: 1; }
+        .mf_status { flex-wrap: wrap; padding: 8px; max-height: 140px; }
+        .mf_status span { flex-basis: 100%; }
+        .mf_btn { right: max(8px, env(safe-area-inset-right)); bottom: max(8px, env(safe-area-inset-bottom)); border-radius: 8px; min-height: 44px; }
+      }
+      @media (max-width: 950px) and (max-height: 500px) and (orientation: landscape) {
+        .mf_hdr { flex-wrap: nowrap; }
+        .mf_hdrmain { flex: 0 0 220px; }
+        .mf_headeractions { flex: 1; width: 0; }
+        .mf_row { display: flex; flex-wrap: nowrap; overflow-x: auto; }
+        .mf_row .mf_inp { width: 180px; flex: 0 0 180px; }
+        .mf_row .mf_sel, .mf_row .mf_iconbtn { width: auto; flex: 0 0 auto; }
+        .mf_row .mf_sel { max-width: 120px; }
+        .mf_status { max-height: 90px; }
+        .mf_status span { flex-basis: 50%; }
+        .mf_item { display: grid; grid-template-columns: auto minmax(0, 1fr) 190px; align-items: start; }
+      }
+
     `;
 
     const toastWrap = document.createElement('div');
@@ -2663,7 +2879,26 @@
               </select>
             </div>
           </div>
+          <div class="mf_status" id="__mf_status__" hidden>
+            <span role="status" aria-live="polite"></span>
+            <button class="mf_iconbtn" id="__mf_cancel__" hidden>Cancel</button>
+            <select class="mf_sel" id="__mf_files__" aria-label="Choose a downloaded file" hidden></select>
+            <button class="mf_iconbtn" id="__mf_save__" hidden>Save again</button>
+          </div>
           <div class="mf_body" id="__mf_body__">
+            <details class="mf_capture" id="__mf_capture__">
+              <summary>Players &amp; recording</summary>
+              <div class="mf_capturecontrols">
+                <select class="mf_sel" id="__mf_player__" aria-label="Select a detected player"></select>
+                <button class="mf_iconbtn" id="__mf_record__">Record player</button>
+                <button class="mf_iconbtn" id="__mf_tabrecord__">Record tab / screen</button>
+                <button class="mf_iconbtn" id="__mf_recordfile__" hidden>Record to file</button>
+                <button class="mf_iconbtn" id="__mf_pause__" hidden>Pause recording</button>
+                <button class="mf_iconbtn" id="__mf_stop__" hidden>Stop &amp; save</button>
+                <label>Stream quality <select class="mf_sel" id="__mf_quality__"><option value="0">Best available</option><option value="1080">Up to 1080p</option><option value="720">Up to 720p</option><option value="480">Up to 480p</option></select></label>
+              </div>
+              <p>Press play first. Recording saves from the current position. Downloads with separate audio save two files; recording makes one file.</p>
+            </details>
             <div class="mf_tip" id="__mf_tip__">${t('tip')}</div>
             <div class="mf_listwrap" id="__mf_list__"></div>
           </div>
@@ -2687,6 +2922,11 @@
     host.appendChild(toastWrap);
     host.appendChild(btn);
     host.appendChild(backdrop);
+    const recbar = document.createElement('div');
+    recbar.className = 'mf_recbar';
+    recbar.hidden = true;
+    recbar.innerHTML = '<span></span><button class="mf_iconbtn">Stop &amp; save</button>';
+    host.appendChild(recbar);
 
     const msgEl = toastWrap.querySelector('.msg');
     const openBtn = toastWrap.querySelector('.open');
@@ -2725,7 +2965,19 @@
     });
 
     ui = {
-      root, host, toastWrap, msgEl, btn, backdrop,
+      root, host, toastWrap, msgEl, btn, backdrop, recbar,
+      status: backdrop.querySelector('#__mf_status__'),
+      cancel: backdrop.querySelector('#__mf_cancel__'),
+      save: backdrop.querySelector('#__mf_save__'),
+      files: backdrop.querySelector('#__mf_files__'),
+      capture: backdrop.querySelector('#__mf_capture__'),
+      player: backdrop.querySelector('#__mf_player__'),
+      record: backdrop.querySelector('#__mf_record__'),
+      tabrecord: backdrop.querySelector('#__mf_tabrecord__'),
+      recordfile: backdrop.querySelector('#__mf_recordfile__'),
+      pause: backdrop.querySelector('#__mf_pause__'),
+      stop: backdrop.querySelector('#__mf_stop__'),
+      quality: backdrop.querySelector('#__mf_quality__'),
       title: backdrop.querySelector('#__mf_title__'),
       owner: backdrop.querySelector('#__mf_owner__'),
       sub: backdrop.querySelector('#__mf_sub__'),
@@ -2759,6 +3011,7 @@
       tip: backdrop.querySelector('#__mf_tip__')
     };
 
+    bindCapture();
     ui.q.addEventListener('input', () => { state.query = ui.q.value || ''; saveStateSoon(); renderList(); });
     ui.filter.addEventListener('change', () => { state.filter = ui.filter.value; saveState(); renderList(); });
     ui.sort.addEventListener('change', () => { state.sort = ui.sort.value; saveState(); renderList(); });
@@ -2769,6 +3022,7 @@
     ui.clear.onclick = () => {
       buildClearBaseline();
       found.clear();
+      foundRev++;
       ytSnapshotSig = '';
       state.previewUrl = '';
       state.previewType = '';
@@ -2997,8 +3251,10 @@
 
   function renderList() {
     ensureUI();
+    const sig = [foundRev, state.filter, state.sort, state.query, state.compact, state.layout, pickLang(), state.previewUrl].join('|');
+    if (!ui.listWrap || sig === listSig) return;
+    listSig = sig;
     const items = listItems();
-    if (!ui.listWrap) return;
 
     if (ui.tip) ui.tip.textContent = t('tip');
     if (ui.listWrap) ui.listWrap.classList.toggle('mf_grid', state.layout === 'grid');
@@ -3030,7 +3286,8 @@
       const size = meta.size ? formatBytes(meta.size) : t('unknown');
       const from = meta.from && meta.from.size ? Array.from(meta.from).join(', ') : '';
       const note = meta.note ? meta.note : t('unknown');
-      const canPreview = (it.type === 'audio' || it.type === 'video' || it.type === 'image') && !isTsSegment(it.url);
+      const mse = meta.mse || /^blob:/i.test(it.url) && Array.from(players).some(([el, info]) => info.src === it.url && el.srcObject);
+      const canPreview = !mse && (it.type === 'audio' || it.type === 'video' || it.type === 'image') && !isTsSegment(it.url);
       const isExtractor = it.type === 'extractor';
       const isSelected = state.previewUrl === it.url;
       const previewLabel = isSelected ? t('hidePreview') : t('preview');
@@ -3050,7 +3307,7 @@
           <div class="mf_actions">
             ${canPreview ? `<button data-act="preview" data-type="${escapeAttr(it.type)}" data-url="${escapeAttr(it.url)}">${previewLabel}</button>` : ''}
             <button data-act="open" data-url="${escapeAttr(it.url)}">${isExtractor ? t('openPage') : t('open')}</button>
-            ${isExtractor ? `<button data-act="probe" data-url="${escapeAttr(it.url)}">${t('probe')}</button><button data-act="copycmd" data-url="${escapeAttr(it.url)}">${t('copyCommand')}</button>` : `<button data-act="download" data-url="${escapeAttr(it.url)}">${t('download')}</button>`}
+            ${isExtractor ? `<button data-act="probe" data-url="${escapeAttr(it.url)}">${t('probe')}</button><button data-act="copycmd" data-url="${escapeAttr(it.url)}">${t('copyCommand')}</button>` : `<button data-act="download" data-url="${escapeAttr(it.url)}">${mse ? 'Record player' : t('download')}</button>`}
             <button data-act="copy" data-url="${escapeAttr(it.url)}">${t('copy')}</button>
           </div>
         </div>
@@ -3068,7 +3325,7 @@
         if (!url) return;
         if (act === 'open') openUrl(url);
         else if (act === 'copy') copyOne(url);
-        else if (act === 'download') downloadUrl(url);
+        else if (act === 'download') { if (found.get(url)?.mse) recordForUrl(url); else downloadUrl(url); }
         else if (act === 'probe') probeBridgeForUrl(url, true);
         else if (act === 'copycmd') copyCommand(url);
         else if (act === 'preview') togglePreview(url, type);
@@ -3157,7 +3414,7 @@
     ensureUI();
 
     const cnt = found.size;
-    const pCnt = players.size;
+    const pCnt = playerEntries().length;
 
     const sub = `${t('found')}: ${cnt} ${t('links')} • ${t('players')}: ${pCnt}`;
     ui.title.textContent = t('title');
@@ -3196,6 +3453,7 @@
   function renderAll() {
     renderHeader();
     renderList();
+    renderCapture();
   }
 
   function escapeHtml(s) {
@@ -3206,6 +3464,7 @@
   }
 
   function maybeToast() {
+    if (inFrame) return;
     if (!state.toast) return;
     const n = now();
     if (n - lastToast < 250) return;
@@ -3295,33 +3554,759 @@
     }
   }
 
-  function downloadUrl(url) {
-    const name = guessFileName(url);
-    try {
-      if (typeof GM_download === 'function') {
-        GM_download({
-          url,
-          name,
-          saveAs: true,
-          onerror: () => openUrl(url)
-        });
-        return;
-      }
-    } catch { }
+  function setStatus(text) {
+    statusText = String(text || '');
+    if (inFrame) { relayFrame(); return; }
+    ensureUI();
+    if (!ui?.status) return;
+    ui.status.hidden = !statusText;
+    ui.status.querySelector('span').textContent = statusText;
+    ui.cancel.hidden = !job;
+    ui.save.hidden = !savedBlob;
+    renderSavedFiles();
+  }
 
-    try {
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = name;
-      a.rel = 'noreferrer noopener';
-      a.style.display = 'none';
-      const parent = document.body || document.documentElement || null;
-      if (parent) parent.appendChild(a);
-      a.click();
-      setTimeout(() => { try { a.remove(); } catch { } }, 0);
-    } catch {
-      openUrl(url);
+  function abortError() { return new DOMException('Cancelled', 'AbortError'); }
+
+  function checkAbort(signal) { if (signal?.aborted) throw abortError(); }
+
+  function waitRetry(ms, signal) {
+    return new Promise((resolve, reject) => {
+      checkAbort(signal);
+      const cancel = () => { clearTimeout(timer); reject(abortError()); };
+      const timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve(); }, ms);
+      signal?.addEventListener('abort', cancel, { once: true });
+    });
+  }
+
+  function requestHeaders(url, base, range, gm) {
+    const exact = reqInfo.get(url) || found.get(url) || {};
+    const parent = reqInfo.get(base) || found.get(base) || {};
+    const same = base && new URL(url).origin === new URL(base).origin;
+    const headers = safeHeaders(exact.headers || (same ? parent.headers : {}));
+    for (const key of Object.keys(headers)) if (key.toLowerCase() === 'range') delete headers[key];
+    if (range) headers.Range = `bytes=${range.start}-${range.end}`;
+    if (gm) headers.Referer = exact.referrer || parent.referrer || location.href;
+    return headers;
+  }
+
+  function rangeData(data, range, status, header) {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (!range) return bytes;
+    const size = range.end - range.start + 1;
+    if (status === 206) {
+      const match = String(header || '').match(/^bytes\s+(\d+)-(\d+)\/(?:\d+|\*)$/i);
+      if (!match || Number(match[1]) !== range.start || Number(match[2]) !== range.end || bytes.byteLength !== size) throw new Error('The server returned the wrong byte range.');
+      return bytes;
     }
+    if (status === 200 && bytes.byteLength > range.end) return bytes.slice(range.start, range.end + 1);
+    throw new Error('The server did not return the requested byte range.');
+  }
+
+  function httpError(status, url) {
+    const error = new Error(`HTTP ${status} from ${new URL(url).hostname}${status === 401 || status === 403 ? '. Press play and rescan to refresh the media link.' : ''}`);
+    error.status = status;
+    return error;
+  }
+
+  async function fetchBytes(url, opts) {
+    if (!rawFetch) throw new Error('Browser fetch is unavailable.');
+    const ctrl = new AbortController();
+    const cancel = () => ctrl.abort();
+    opts.signal?.addEventListener('abort', cancel, { once: true });
+    const timer = setTimeout(cancel, 30000);
+    try {
+      checkAbort(opts.signal);
+      const resp = await rawFetch(url, { credentials: 'include', headers: requestHeaders(url, opts.base, opts.range, false), signal: ctrl.signal });
+      if (!resp.ok) throw httpError(resp.status, url);
+      const limit = opts.limit || CFG.maxMemoryBytes;
+      if (Number(resp.headers.get('content-length')) > limit) {
+        ctrl.abort();
+        throw new Error('This response exceeds the memory limit. Use a native downloader or Record to file.');
+      }
+      const chunks = [];
+      let total = 0;
+      if (resp.body?.getReader) {
+        const reader = resp.body.getReader();
+        try {
+          while (true) {
+            const part = await reader.read();
+            if (part.done) break;
+            total += part.value.byteLength;
+            if (total > limit) { reader.cancel().catch(() => {}); throw new Error('The response exceeds the memory limit.'); }
+            chunks.push(part.value);
+            opts.progress?.(total, Number(resp.headers.get('content-length')) || 0);
+          }
+        } finally { reader.releaseLock(); }
+      } else {
+        const bytes = new Uint8Array(await resp.arrayBuffer());
+        total = bytes.byteLength;
+        if (total > limit) throw new Error('The response exceeds the memory limit.');
+        chunks.push(bytes);
+      }
+      checkAbort(opts.signal);
+      const all = new Uint8Array(total);
+      let at = 0;
+      for (const bytes of chunks) { all.set(bytes, at); at += bytes.byteLength; }
+      return { data: rangeData(all, opts.range, resp.status, resp.headers.get('content-range')), mime: resp.headers.get('content-type') || '', url: resp.url || url };
+    } finally { clearTimeout(timer); opts.signal?.removeEventListener('abort', cancel); }
+  }
+
+  function gmBytes(url, opts) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') { reject(new Error('Cross-origin requests are unavailable in this userscript manager.')); return; }
+      checkAbort(opts.signal);
+      let handle;
+      let settled = false;
+      const finish = (err, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', cancel);
+        err ? reject(err) : resolve(value);
+      };
+      const cancel = () => { handle?.abort?.(); finish(abortError()); };
+      const timer = setTimeout(() => { handle?.abort?.(); finish(new Error('Cross-origin request timed out.')); }, 35000);
+      opts.signal?.addEventListener('abort', cancel, { once: true });
+      try {
+        handle = GM_xmlhttpRequest({
+          method: 'GET', url, responseType: 'arraybuffer', timeout: 30000,
+          headers: requestHeaders(url, opts.base, opts.range, true),
+          onprogress: value => {
+            if (value.loaded > (opts.limit || CFG.maxMemoryBytes)) {
+              handle?.abort?.();
+              finish(new Error('The response exceeds the memory limit.'));
+            } else opts.progress?.(value.loaded || 0, value.total || 0);
+          },
+          onload: resp => {
+            try {
+              if (resp.status < 200 || resp.status >= 300) throw httpError(resp.status, url);
+              if (!resp.response || resp.response.byteLength > (opts.limit || CFG.maxMemoryBytes)) throw new Error('The response is empty or exceeds the memory limit.');
+              const headers = String(resp.responseHeaders || '');
+              const mime = headers.match(/^content-type:\s*([^\r\n]+)/im)?.[1] || '';
+              const range = headers.match(/^content-range:\s*([^\r\n]+)/im)?.[1] || '';
+              finish(null, { data: rangeData(resp.response, opts.range, resp.status, range), mime, url: resp.finalUrl || url });
+            } catch (error) { finish(error); }
+          },
+          onerror: () => finish(new Error('Cross-origin request failed. Check the userscript manager’s connection permission.')),
+          ontimeout: () => finish(new Error('Cross-origin request timed out.')),
+          onabort: () => finish(opts.signal?.aborted ? abortError() : new Error('Request aborted.'))
+        });
+      } catch (error) { finish(error); }
+    });
+  }
+
+  async function requestBytes(url, opts = {}) {
+    checkAbort(opts.signal);
+    let last;
+    let target = url;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      for (const request of [fetchBytes, gmBytes]) {
+        try { return await request(target, opts); }
+        catch (error) { checkAbort(opts.signal); last = error; }
+      }
+      if ((last?.status === 401 || last?.status === 403 || last?.status === 404) && opts.base && target === url) {
+        const parent = new URL(opts.base);
+        const child = new URL(url);
+        if (child.origin === parent.origin && parent.search) {
+          for (const [key, value] of parent.searchParams) if (!child.searchParams.has(key)) child.searchParams.append(key, value);
+          if (child.href !== url) { target = child.href; continue; }
+        }
+      }
+      if (last?.status && last.status < 500 && last.status !== 408 && last.status !== 429) break;
+      if (/memory limit|byte range|empty|unavailable/i.test(last?.message || '')) break;
+      if (attempt < 2) await waitRetry(500 * (attempt + 1), opts.signal);
+    }
+    throw last || new Error('The media could not be fetched.');
+  }
+
+  function cleanName(name) { return String(name || 'media').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').slice(0, 180) || 'media'; }
+
+  function outputName(url, suffix) {
+    const name = cleanName(document.title || guessFileName(url) || 'media').replace(/\.(mp4|webm|m3u8|mpd|ts|aac|m4a)$/i, '');
+    return `${name}.${suffix}`;
+  }
+
+  function saveBlob(blob, name) {
+    savedBlob = { blob, name: cleanName(name) };
+    if (!savedFiles.some(item => item.blob === blob)) savedFiles.push(savedBlob);
+    if (inFrame) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = savedBlob.name;
+    a.style.display = 'none';
+    (document.body || document.documentElement).appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+    setStatus(statusText);
+  }
+
+  function attrs(text) {
+    const out = {};
+    const re = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/gi;
+    let match;
+    while ((match = re.exec(text))) out[match[1].toUpperCase()] = match[2].replace(/^"|"$/g, '');
+    return out;
+  }
+
+  function byteRange(value, prior, url) {
+    if (!value) return null;
+    const match = String(value).match(/^(\d+)(?:@(\d+))?$/);
+    if (!match || !Number(match[1])) throw new Error('Invalid HLS byte range.');
+    const start = match[2] !== undefined ? Number(match[2]) : prior?.url === url ? prior.end + 1 : NaN;
+    const end = start + Number(match[1]) - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) throw new Error('The HLS byte range has no valid starting offset.');
+    return { start, end, url };
+  }
+
+  function parseHls(text, base, inherited = {}) {
+    if (!/^\s*#EXTM3U/.test(text)) throw new Error('The response is not an HLS playlist.');
+    const out = { variants: [], audio: [], parts: [], ended: false, duration: 0, vars: { ...inherited } };
+    let variant = null;
+    let key = null;
+    let init = null;
+    let range = '';
+    let prior = null;
+    let priorMap = null;
+    let seq = 0n;
+    let secs = 0;
+    let gap = false;
+    const resolve = uri => new URL(uri.replace(/\{\$([^}]+)\}/g, (_, name) => {
+      if (!(name in out.vars)) throw new Error(`Missing HLS variable: ${name}`);
+      return out.vars[name];
+    }), base).href;
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith('#EXT-X-DEFINE:')) {
+        const a = attrs(line.slice(14));
+        if (a.NAME && a.VALUE !== undefined) out.vars[a.NAME] = a.VALUE;
+        if (a.QUERYPARAM) out.vars[a.QUERYPARAM] = new URL(base).searchParams.get(a.QUERYPARAM) || '';
+      } else if (line.startsWith('#EXT-X-STREAM-INF:')) variant = attrs(line.slice(18));
+      else if (line.startsWith('#EXT-X-MEDIA:')) {
+        const a = attrs(line.slice(13));
+        if (a.TYPE === 'AUDIO' && a.URI) out.audio.push({ ...a, url: resolve(a.URI) });
+      } else if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+        const value = line.slice(22).trim();
+        if (!/^\d+$/.test(value)) throw new Error('Invalid HLS media sequence.');
+        seq = BigInt(value);
+      } else if (line.startsWith('#EXT-X-KEY:')) {
+        const a = attrs(line.slice(11));
+        if (a.METHOD === 'NONE') key = null;
+        else if (a.METHOD !== 'AES-128' || a.KEYFORMAT && a.KEYFORMAT !== 'identity') throw new Error('This HLS stream uses DRM or sample encryption. Use the site’s download option.');
+        else {
+          if (!a.URI) throw new Error('The HLS AES-128 key URL is missing.');
+          key = { url: resolve(a.URI), iv: a.IV || '', base };
+        }
+      } else if (line.startsWith('#EXT-X-MAP:')) {
+        const a = attrs(line.slice(11));
+        if (!a.URI) throw new Error('The HLS initialization URL is missing.');
+        const url = resolve(a.URI);
+        const bytes = byteRange(a.BYTERANGE, priorMap, url);
+        if (bytes) priorMap = bytes;
+        if (key && !key.iv) throw new Error('Encrypted HLS initialization requires an explicit IV.');
+        init = { url, range: bytes, key: key && { ...key }, seq, base };
+      } else if (line.startsWith('#EXT-X-BYTERANGE:')) range = line.slice(17);
+      else if (line.startsWith('#EXTINF:')) secs = Number(line.slice(8).split(',')[0]) || 0;
+      else if (line === '#EXT-X-GAP') gap = true;
+      else if (line === '#EXT-X-ENDLIST') out.ended = true;
+      else if (!line.startsWith('#')) {
+        const url = resolve(line);
+        if (variant) {
+          out.variants.push({ ...variant, url, height: Number(variant.RESOLUTION?.split('x')[1]) || 0, rate: Number(variant['AVERAGE-BANDWIDTH'] || variant.BANDWIDTH) || 0 });
+          variant = null;
+        } else {
+          if (gap) throw new Error('The playlist contains missing media segments. Recording may work while the player is playing.');
+          const bytes = byteRange(range, prior, url);
+          prior = bytes;
+          out.parts.push({ url, range: bytes, key: key && { ...key }, init, seq, base });
+          out.duration += secs;
+          seq++;
+          range = '';
+          secs = 0;
+          gap = false;
+          if (out.parts.length > CFG.maxParts) throw new Error('The playlist has too many segments for an in-browser download.');
+        }
+      }
+    }
+    return out;
+  }
+
+  function pickQuality(list) {
+    const sorted = list.slice().sort((a, b) => (b.height || 0) - (a.height || 0) || (b.rate || 0) - (a.rate || 0));
+    return sorted.find(item => !quality || !item.height || item.height <= quality) || sorted[sorted.length - 1];
+  }
+
+  async function loadManifest(url, signal, base) {
+    try {
+      const result = await requestBytes(url, { signal, base, limit: 2 * 1024 * 1024 });
+      const text = new TextDecoder().decode(result.data);
+      if (!/^\s*#EXTM3U|<MPD[\s>]/i.test(text)) throw new Error('The server returned a page instead of a media manifest.');
+      cacheManifest(result.url, text);
+      return { text, url: result.url };
+    } catch (error) {
+      checkAbort(signal);
+      const old = manifests.get(url);
+      if (old && now() - old.time < 60000) return { text: old.text, url };
+      throw error;
+    }
+  }
+
+  async function hlsTracks(text, url, signal, depth = 0, vars = {}) {
+    if (depth > 5) throw new Error('The HLS playlist nesting is too deep.');
+    const parsed = parseHls(text, url, vars);
+    if (!parsed.variants.length) {
+      if (!parsed.parts.length) throw new Error('No media segments were found in the playlist.');
+      const maps = new Set(parsed.parts.filter(p => p.init).map(p => p.init.url + ':' + (p.init.range?.start || 0)));
+      if (maps.size > 1) throw new Error('This stream changes its initialization data. Record the player to keep a single playable file.');
+      const isMp4 = maps.size > 0;
+      const isAac = /\.aac(?:$|[?#])/i.test(parsed.parts[0].url);
+      return [{ parts: parsed.parts, ext: isMp4 ? 'mp4' : isAac ? 'aac' : 'ts', mime: isMp4 ? 'video/mp4' : isAac ? 'audio/aac' : 'video/mp2t', live: !parsed.ended, duration: parsed.duration }];
+    }
+    const best = pickQuality(parsed.variants);
+    const media = await loadManifest(best.url, signal, url);
+    const tracks = await hlsTracks(media.text, media.url, signal, depth + 1, parsed.vars);
+    const group = best.AUDIO;
+    const audio = parsed.audio.filter(item => item['GROUP-ID'] === group);
+    const selected = audio.find(item => item.DEFAULT === 'YES') || audio.find(item => item.AUTOSELECT === 'YES') || audio[0];
+    if (selected && selected.url !== best.url) {
+      const manifest = await loadManifest(selected.url, signal, url);
+      const extra = await hlsTracks(manifest.text, manifest.url, signal, depth + 1, parsed.vars);
+      for (const track of extra) { track.audio = true; if (track.ext === 'mp4') { track.ext = 'm4a'; track.mime = 'audio/mp4'; } }
+      tracks.push(...extra);
+    }
+    return tracks;
+  }
+
+  function ivBytes(value, seq) {
+    let hex;
+    if (value) {
+      hex = String(value).replace(/^0x/i, '');
+      if (!/^[\da-f]{1,32}$/i.test(hex)) throw new Error('Invalid HLS AES initialization vector.');
+    } else hex = BigInt(seq).toString(16);
+    if (hex.length > 32) throw new Error('The HLS media sequence exceeds 128 bits.');
+    hex = hex.padStart(32, '0');
+    return Uint8Array.from(hex.match(/../g), byte => parseInt(byte, 16));
+  }
+
+  async function decryptPart(bytes, part, keys, signal) {
+    if (!part.key) return bytes;
+    if (!crypto.subtle) throw new Error('AES-128 downloads need Web Crypto on an HTTPS page.');
+    const url = part.key.url;
+    if (!keys.has(url)) keys.set(url, (async () => {
+      const result = await requestBytes(url, { base: part.key.base, signal, limit: 1024 });
+      if (result.data.byteLength !== 16) throw new Error('The stream did not provide a valid 16-byte AES-128 key.');
+      return crypto.subtle.importKey('raw', result.data, { name: 'AES-CBC' }, false, ['decrypt']);
+    })());
+    const key = await keys.get(url);
+    try { return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC', iv: ivBytes(part.key.iv, part.seq) }, key, bytes)); }
+    catch { throw new Error('AES-128 decryption failed. The key or media link may have expired.'); }
+  }
+
+  function xmlChildren(el, name) { return Array.from(el?.children || []).filter(child => child.localName === name); }
+  function xmlChild(el, name) { return xmlChildren(el, name)[0] || null; }
+
+  function durationSecs(value) {
+    const match = String(value || '').match(/^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/);
+    return match ? Number(match[1] || 0) * 86400 + Number(match[2] || 0) * 3600 + Number(match[3] || 0) * 60 + Number(match[4] || 0) : 0;
+  }
+
+  function dashUrl(template, rep, number, time) {
+    const mark = '\u0001';
+    return String(template || '').replace(/\$\$/g, mark).replace(/\$(RepresentationID|Bandwidth|Number|Time)(?:%0(\d+)d)?\$/g, (_, key, width) => {
+      const value = key === 'RepresentationID' ? rep.getAttribute('id') || '' : key === 'Bandwidth' ? rep.getAttribute('bandwidth') || '0' : key === 'Number' ? number : time;
+      return width ? String(value).padStart(Math.min(Number(width), 20), '0') : String(value);
+    }).replaceAll(mark, '$');
+  }
+
+  function parseDash(text, url) {
+    const doc = new DOMParser().parseFromString(text, 'application/xml');
+    const mpd = doc.documentElement;
+    if (mpd.localName !== 'MPD' || doc.querySelector('parsererror')) throw new Error('Invalid DASH manifest.');
+    if (mpd.getAttribute('type') === 'dynamic') throw new Error('Live DASH needs player recording. Use Record player while the video plays.');
+    if (Array.from(doc.getElementsByTagNameNS('*', 'ContentProtection')).length) throw new Error('This DASH stream is DRM protected. Use the site’s download option.');
+    const periods = xmlChildren(mpd, 'Period');
+    if (periods.length !== 1) throw new Error('This DASH stream has multiple periods. Record the player for a single continuous file.');
+    const period = periods[0];
+    const duration = durationSecs(period.getAttribute('duration')) || durationSecs(mpd.getAttribute('mediaPresentationDuration')) - durationSecs(period.getAttribute('start'));
+    const candidates = [];
+    for (const group of xmlChildren(period, 'AdaptationSet')) {
+      for (const rep of xmlChildren(group, 'Representation')) {
+        const chain = [mpd, period, group, rep];
+        let base = url;
+        let temp = {};
+        let timeline = null;
+        let segList = null;
+        let hasBase = false;
+        for (const node of chain) {
+          const value = xmlChild(node, 'BaseURL')?.textContent?.trim();
+          if (value) { base = new URL(value, base).href; hasBase = true; }
+          const tpl = xmlChild(node, 'SegmentTemplate');
+          if (tpl) {
+            for (const attr of tpl.attributes) temp[attr.name] = attr.value;
+            timeline = xmlChild(tpl, 'SegmentTimeline') || timeline;
+          }
+          segList = xmlChild(node, 'SegmentList') || segList;
+        }
+        const mime = rep.getAttribute('mimeType') || group.getAttribute('mimeType') || '';
+        const type = rep.getAttribute('contentType') || group.getAttribute('contentType') || mime.split('/')[0] || (rep.hasAttribute('height') ? 'video' : '');
+        if (type !== 'video' && type !== 'audio') continue;
+        const parts = [];
+        const resolve = value => new URL(value, base).href;
+        const range = value => {
+          if (!value) return null;
+          const match = value.match(/^(\d+)-(\d+)$/);
+          if (!match || Number(match[2]) < Number(match[1])) throw new Error('Invalid DASH byte range.');
+          return { start: Number(match[1]), end: Number(match[2]) };
+        };
+        if (segList) {
+          const init = xmlChild(segList, 'Initialization');
+          if (init) parts.push({ url: resolve(init.getAttribute('sourceURL') || ''), range: range(init.getAttribute('range')), base: url });
+          for (const segment of xmlChildren(segList, 'SegmentURL')) parts.push({ url: resolve(segment.getAttribute('media') || ''), range: range(segment.getAttribute('mediaRange')), base: url });
+        } else if (temp.media) {
+          if (temp.initialization) parts.push({ url: resolve(dashUrl(temp.initialization, rep, 0, 0)), base: url });
+          const scale = Number(temp.timescale || 1);
+          let number = Number(temp.startNumber || 1);
+          const pto = Number(temp.presentationTimeOffset || 0);
+          if (!(scale > 0) || !Number.isSafeInteger(number)) throw new Error('Invalid DASH template timing.');
+          const append = time => {
+            parts.push({ url: resolve(dashUrl(temp.media, rep, number++, time)), base: url });
+            if (parts.length > CFG.maxParts) throw new Error('The DASH stream has too many segments for an in-browser download.');
+          };
+          if (timeline) {
+            const entries = xmlChildren(timeline, 'S');
+            let time = 0;
+            for (let i = 0; i < entries.length; i++) {
+              const item = entries[i];
+              if (item.hasAttribute('t')) time = Number(item.getAttribute('t'));
+              const d = Number(item.getAttribute('d'));
+              let count = Number(item.getAttribute('r') || 0) + 1;
+              if (!(d > 0) || !Number.isFinite(time) || !Number.isInteger(count)) throw new Error('Invalid DASH segment timeline.');
+              if (count === 0) {
+                const end = entries[i + 1]?.hasAttribute('t') ? Number(entries[i + 1].getAttribute('t')) : duration * scale + pto;
+                if (!(end > time)) throw new Error('The DASH timeline has no bounded end.');
+                count = Math.ceil((end - time) / d);
+              }
+              if (count < 1 || count > CFG.maxParts) throw new Error('The DASH timeline is too large.');
+              for (let j = 0; j < count; j++) { append(time); time += d; }
+            }
+          } else {
+            const d = Number(temp.duration);
+            if (!(duration > 0) || !(d > 0)) throw new Error('The DASH stream has no bounded segment duration.');
+            const count = Math.ceil(duration * scale / d);
+            if (count > CFG.maxParts) throw new Error('The DASH stream is too large.');
+            for (let i = 0; i < count; i++) append(pto + i * d);
+          }
+        } else if (hasBase && new URL(base).pathname !== new URL(url).pathname) parts.push({ url: base, base: url });
+        else throw new Error('This DASH segment layout is unsupported. Record the player instead.');
+        if (!parts.length) throw new Error('The DASH representation has no media segments.');
+        candidates.push({ parts, height: Number(rep.getAttribute('height')) || 0, rate: Number(rep.getAttribute('bandwidth')) || 0, audio: type === 'audio', mime: mime || `${type}/mp4`, ext: /webm/i.test(mime) ? 'webm' : type === 'audio' ? 'm4a' : 'mp4' });
+      }
+    }
+    const tracks = [];
+    for (const audio of [false, true]) {
+      const list = candidates.filter(item => item.audio === audio);
+      if (list.length) tracks.push(pickQuality(list));
+    }
+    if (!tracks.length) throw new Error('No clear DASH audio or video tracks were found.');
+    return tracks;
+  }
+
+  async function downloadTracks(tracks, url, task) {
+    const signal = task.ctrl.signal;
+    const keys = new Map();
+    let total = 0;
+    const blobs = [];
+    for (let index = 0; index < tracks.length; index++) {
+      const track = tracks[index];
+      const parts = [];
+      let initSig = '';
+      for (const part of track.parts) {
+        if (part.init) {
+          const sig = part.init.url + ':' + JSON.stringify(part.init.range);
+          if (sig !== initSig) { parts.push(part.init); initSig = sig; }
+        }
+        parts.push(part);
+      }
+      const chunks = [];
+      const concurrency = matchMedia('(pointer: coarse)').matches ? 2 : 3;
+      for (let at = 0; at < parts.length; at += concurrency) {
+        checkAbort(signal);
+        const batch = await Promise.allSettled(parts.slice(at, at + concurrency).map(async part => {
+          const result = await requestBytes(part.url, { signal, base: part.base, range: part.range, limit: Math.min(128 * 1024 * 1024, CFG.maxMemoryBytes - total) });
+          if (/text\/html|application\/json/i.test(result.mime)) throw new Error('A media segment returned an error page. Refresh the player and try again.');
+          return decryptPart(result.data, part, keys, signal);
+        }));
+        const failure = batch.find(item => item.status === 'rejected');
+        if (failure) throw failure.reason;
+        for (const item of batch) {
+          total += item.value.byteLength;
+          if (total > CFG.maxMemoryBytes) throw new Error('This download exceeds the browser memory limit. Use Record to file or a native downloader.');
+          chunks.push(item.value);
+        }
+        setStatus(`Downloading ${track.audio ? 'audio' : 'video'} ${index + 1}/${tracks.length}: ${Math.min(at + concurrency, parts.length)}/${parts.length} segments · ${formatBytes(total)}${track.live ? ' · current live window only' : ''}`);
+      }
+      checkAbort(signal);
+      const blob = new Blob(chunks, { type: track.mime });
+      const suffix = tracks.length > 1 ? `${track.audio ? 'audio' : 'video'}.${track.ext}` : track.ext;
+      blobs.push({ blob, name: outputName(url, suffix) });
+    }
+    checkAbort(signal);
+    for (const item of blobs) saveBlob(item.blob, item.name);
+    setStatus(`${tracks.length > 1 ? 'Video and audio downloaded as separate files. Use recording for one file.' : 'Download ready.'}${tracks.some(track => track.live) ? ' Only the available live window was saved.' : ''} If your mobile browser did not save it, tap Save again.`);
+  }
+
+  function nativeDownload(url, task) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_download !== 'function') { reject(new Error('Native download is unavailable.')); return; }
+      let handle;
+      let done = false;
+      const signal = task.ctrl.signal;
+      const finish = error => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        signal.removeEventListener('abort', cancel);
+        error ? reject(error) : resolve();
+      };
+      const cancel = () => { handle?.abort?.(); finish(abortError()); };
+      let timer;
+      const reset = () => { clearTimeout(timer); timer = setTimeout(() => { handle?.abort?.(); finish(new Error('Native download stalled.')); }, 45000); };
+      signal.addEventListener('abort', cancel, { once: true });
+      reset();
+      try {
+        handle = GM_download({
+          url, name: cleanName(guessFileName(url)), saveAs: true, headers: requestHeaders(url, url, null, true),
+          onload: () => finish(), onerror: value => finish(new Error(value?.error || 'Native download failed.')),
+          ontimeout: () => finish(new Error('Native download timed out.')),
+          onprogress: value => { reset(); setStatus(`Downloading · ${formatBytes(value.loaded || 0)}${value.total ? ' / ' + formatBytes(value.total) : ''}`); }
+        });
+      } catch (error) { finish(error); }
+    });
+  }
+
+  async function downloadUrl(url) {
+    if (rec) { setStatus('Stop and save the recording before starting a download.'); return; }
+    if (job) { setStatus('A download is already running. Cancel it before starting another.'); return; }
+    const meta = found.get(url) || {};
+    if (meta.mse) { recordForUrl(url); return; }
+    const task = { ctrl: new AbortController() };
+    job = task;
+    savedBlob = null;
+    savedFiles = [];
+    setStatus('Fetching media…');
+    try {
+      const type = guessType(url, meta.mime, meta.kind);
+      if (type === 'playlist') {
+        const manifest = await loadManifest(url, task.ctrl.signal);
+        const tracks = /^\s*#EXTM3U/.test(manifest.text) ? await hlsTracks(manifest.text, manifest.url, task.ctrl.signal) : parseDash(manifest.text, manifest.url);
+        await downloadTracks(tracks, url, task);
+      } else {
+        let native = false;
+        if (/^https?:/i.test(url)) {
+          try { await nativeDownload(url, task); native = true; setStatus('Download finished.'); }
+          catch { checkAbort(task.ctrl.signal); setStatus('Trying a cross-origin media fetch…'); }
+        }
+        if (!native) {
+          const result = await requestBytes(url, { signal: task.ctrl.signal, progress: loaded => setStatus(`Fetching media · ${formatBytes(loaded)}`) });
+          if (/text\/html/i.test(result.mime)) throw new Error('The link returned a web page. Press play, rescan, or record the detected player.');
+          const isText = /mpegurl|dash\+xml/i.test(result.mime) || result.data.length < 2 * 1024 * 1024 && /^\s*#EXTM3U|<MPD[\s>]/i.test(new TextDecoder().decode(result.data.subarray(0, 200)));
+          if (isText) {
+            const text = new TextDecoder().decode(result.data);
+            const tracks = /^\s*#EXTM3U/.test(text) ? await hlsTracks(text, result.url, task.ctrl.signal) : parseDash(text, result.url);
+            await downloadTracks(tracks, url, task);
+          } else {
+            const suffix = /video\/mp4/i.test(result.mime) ? 'mp4' : /video\/webm/i.test(result.mime) ? 'webm' : /audio\/mp4/i.test(result.mime) ? 'm4a' : '';
+            saveBlob(new Blob([result.data], { type: result.mime || 'application/octet-stream' }), suffix ? outputName(url, suffix) : guessFileName(url));
+            setStatus('Download ready. If your mobile browser did not save it, tap Save again.');
+          }
+        }
+      }
+    } catch (error) {
+      setStatus(error.name === 'AbortError' ? 'Download cancelled.' : `Download failed: ${error.message} Select a player under Players & recording to try recording.`);
+    } finally { task.ctrl.abort(); if (job === task) job = null; setStatus(statusText); renderCapture(); }
+  }
+
+  function playerEntries() {
+    const list = Array.from(players).filter(([el]) => el.isConnected).map(([el, info]) => ({ id: info.id, el, info }));
+    for (const [source, frame] of frameInfo) {
+      if (!isFrameSource(source) || now() - frame.last > 60000) { frameInfo.delete(source); continue; }
+      for (const info of frame.players) list.push({ id: frame.id + ':' + info.id, info, frame });
+    }
+    return list;
+  }
+
+  function recordForUrl(url) {
+    const entry = playerEntries().find(item => item.info.src === url);
+    if (entry) { if (ui?.player) ui.player.value = entry.id; startRecord('player', false, entry.el, entry); }
+    else { if (ui?.capture) ui.capture.open = true; setStatus('Select the player under Players & recording, press play, then tap Record player.'); }
+  }
+
+  function recordMime(stream) {
+    const video = stream.getVideoTracks().length > 0;
+    const choices = video ? ['video/mp4', 'video/webm;codecs=vp8,opus', 'video/webm'] : ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg'];
+    return choices.find(value => MediaRecorder.isTypeSupported(value)) || '';
+  }
+
+  async function waitTracks(stream, el) {
+    const ready = () => stream.getTracks().some(track => track.readyState === 'live') && (el?.tagName !== 'VIDEO' || stream.getVideoTracks().length > 0);
+    if (ready()) return;
+    await new Promise((resolve, reject) => {
+      const check = () => { if (ready()) { clean(); resolve(); } };
+      const clean = () => { clearTimeout(timer); stream.removeEventListener('addtrack', check); };
+      const timer = setTimeout(() => { clean(); reject(new Error('The player has no capturable media tracks. Press play first, or use Record tab / screen.')); }, 5000);
+      stream.addEventListener('addtrack', check);
+    });
+  }
+
+  async function startRecord(mode, toFile = false, forcedEl, forcedEntry) {
+    if (rec) { setStatus('A recording is already running. Use Stop & save first.'); return; }
+    if (job) { setStatus('Finish or cancel the download before recording.'); return; }
+    if (typeof MediaRecorder !== 'function') { setStatus('This browser does not support MediaRecorder. Try a browser with recording support.'); return; }
+    const entry = forcedEntry || (!inFrame ? playerEntries().find(item => item.id === ui?.player?.value) : null);
+    const el = forcedEl || entry?.el;
+    if (mode === 'player' && entry?.frame) {
+      if (entry.info.protected) { setStatus('The embedded player is DRM protected. Use the site’s download option.'); return; }
+      const frame = entry.frame;
+      rec = { remote: frame.source, origin: frame.origin, time: now(), pending: true, paused: false };
+      const current = rec;
+      current.timer = setTimeout(() => {
+        if (rec === current && !current.started) { sendFrame(current.remote, current.origin, 'stop'); rec = null; setStatus('The embedded player did not start recording. Press play inside it and try again.'); renderCapture(); }
+      }, 15000);
+      sendFrame(frame.source, frame.origin, 'record', { id: entry.info.id });
+      setStatus('Starting embedded player recording…');
+      renderCapture();
+      return;
+    }
+    if (mode === 'player' && !el) { if (ui?.capture) ui.capture.open = true; setStatus('No player selected. Press play on the page and select its player.'); return; }
+    if (el && (el.mediaKeys || players.get(el)?.protected)) { setStatus('The player is DRM protected. Use the site’s download option.'); return; }
+    let stream;
+    let writer;
+    let handle;
+    const current = { time: now(), chunks: [], size: 0, el: mode === 'player' ? el : null, paused: false, pending: true, writes: Promise.resolve(), finishing: false, reason: '' };
+    rec = current;
+    savedBlob = null;
+    savedFiles = [];
+    try {
+      if (mode === 'tab') {
+        if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') throw new Error('Tab / screen recording is unavailable in this browser. On mobile, try Record player.');
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+      } else {
+        if (el.readyState < 2 || el.tagName === 'VIDEO' && !el.videoWidth) throw new Error('Press play on the video first, then tap Record player.');
+        const capture = el.captureStream || el.mozCaptureStream;
+        if (el.srcObject?.getTracks) stream = new MediaStream(el.srcObject.getTracks().map(track => track.clone()));
+        else if (typeof capture === 'function') stream = capture.call(el);
+        else throw new Error('This browser cannot capture this player directly. Try Record tab / screen if available.');
+        const mime = recordMime(stream);
+        const ext = /mp4/i.test(mime) ? el.tagName === 'AUDIO' ? 'm4a' : 'mp4' : /ogg/i.test(mime) ? 'ogg' : 'webm';
+        const play = el.paused ? el.play() : null;
+        if (toFile) {
+          if (typeof page.showSaveFilePicker !== 'function') throw new Error('Direct file recording is unavailable in this browser.');
+          handle = await page.showSaveFilePicker({ suggestedName: outputName(location.href, ext) });
+        }
+        if (play) await play;
+      }
+      current.stream = stream;
+      if (rec !== current || current.cancelled) throw abortError();
+      await waitTracks(stream, mode === 'player' ? el : null);
+      if (rec !== current || current.cancelled) throw abortError();
+      if (handle) { writer = await handle.createWritable(); current.writer = writer; }
+      const mime = recordMime(stream);
+      const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      current.recorder = recorder;
+      current.ext = /mp4/i.test(recorder.mimeType) ? stream.getVideoTracks().length ? 'mp4' : 'm4a' : /ogg/i.test(recorder.mimeType) ? 'ogg' : 'webm';
+      current.mime = recorder.mimeType || mime || 'video/webm';
+      current.pending = false;
+      current.time = now();
+      current.name = outputName(location.href, 'recording.' + current.ext);
+      current.stop = () => stopRecord();
+      if (current.el) current.el.addEventListener('ended', current.stop, { once: true });
+      for (const track of stream.getTracks()) track.addEventListener('ended', current.stop, { once: true });
+      recorder.ondataavailable = event => {
+        if (!event.data?.size) return;
+        current.size += event.data.size;
+        if (writer) {
+          current.writes = current.writes.then(() => writer.write(event.data)).catch(error => {
+            current.writeError = error;
+            current.reason = 'The output file could not be written: ' + error.message;
+            stopRecord(current.reason);
+          });
+        } else {
+          current.chunks.push(event.data);
+          if (current.size > CFG.maxMemoryBytes - 8 * 1024 * 1024) stopRecord('The recording reached the memory limit. The recorded part was saved. Use Record to file for longer videos.');
+        }
+      };
+      recorder.onerror = event => stopRecord('The recorder failed: ' + (event.error?.message || 'unknown error'));
+      recorder.onstop = () => finishRecord(current);
+      recorder.start(1000);
+      current.timer = setInterval(() => {
+        if (current.el && !current.el.isConnected) stopRecord('The player was removed. The recorded part was saved.');
+        else if (current.el?.mediaKeys || players.get(current.el)?.protected) stopRecord('DRM was detected. Recording stopped.');
+        else renderRecordStatus(current);
+      }, 1000);
+      if (ui?.capture) ui.capture.open = true;
+      renderRecordStatus(current);
+      renderCapture();
+    } catch (error) {
+      for (const track of stream?.getTracks?.() || []) track.stop();
+      if (writer) await writer.abort().catch(() => {});
+      if (rec === current) rec = null;
+      const text = error.name === 'AbortError' ? 'Recording cancelled.' : `Recording could not start: ${error.message}`;
+      setStatus(text);
+      if (inFrame) window.top.postMessage({ channel: CHANNEL, type: 'record-result', status: text }, '*');
+      renderCapture();
+    }
+  }
+
+  function renderRecordStatus(current) {
+    const secs = Math.floor((now() - current.time) / 1000);
+    const label = `${current.paused ? 'Recording paused' : 'Recording'} · ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} · ${formatBytes(current.size || 0)}${current.stream && !current.stream.getAudioTracks().length ? ' · no audio track' : ''}${current.writer ? ' · saving to file' : ''}`;
+    setStatus(label);
+    if (ui?.recbar) { ui.recbar.hidden = false; ui.recbar.querySelector('span').textContent = label; }
+  }
+
+  function stopRecord(reason = '') {
+    const current = rec;
+    if (!current) return;
+    if (current.remote) { sendFrame(current.remote, current.origin, 'stop'); setStatus('Saving embedded player recording…'); return; }
+    if (reason) current.reason = reason;
+    if (current.pending) { current.cancelled = true; rec = null; renderCapture(); return; }
+    if (current.recorder?.state !== 'inactive') current.recorder.stop();
+  }
+
+  function pauseRecord() {
+    if (!rec || rec.pending) return;
+    if (rec.remote) { sendFrame(rec.remote, rec.origin, 'pause'); rec.paused = !rec.paused; }
+    else if (rec.recorder.state === 'recording') { rec.recorder.pause(); rec.paused = true; }
+    else if (rec.recorder.state === 'paused') { rec.recorder.resume(); rec.paused = false; }
+    renderCapture();
+  }
+
+  async function finishRecord(current) {
+    if (current.finishing) return;
+    current.finishing = true;
+    clearInterval(current.timer);
+    current.el?.removeEventListener('ended', current.stop);
+    for (const track of current.stream?.getTracks?.() || []) { track.removeEventListener('ended', current.stop); track.stop(); }
+    let blob = null;
+    let text;
+    try {
+      await current.writes;
+      if (current.writeError) throw current.writeError;
+      if (current.writer) { await current.writer.close(); text = current.reason || 'Recording saved to the selected file.'; }
+      else {
+        blob = new Blob(current.chunks, { type: current.mime });
+        text = blob.size ? current.reason || 'Recording ready. If your mobile browser did not save it, tap Save again.' : current.reason || 'The player produced no recording data. Try Record tab / screen.';
+      }
+    } catch (error) { await current.writer?.abort().catch(() => {}); text = 'The recording file could not be saved: ' + error.message; }
+    current.chunks.length = 0;
+    if (rec === current) rec = null;
+    if (inFrame) window.top.postMessage({ channel: CHANNEL, type: 'record-result', blob, name: current.name, status: text }, '*');
+    else if (blob?.size) saveBlob(blob, current.name);
+    setStatus(text);
+    renderCapture();
   }
 
   function focusPreviewPane() {
@@ -3519,43 +4504,132 @@
 
   let renderT = null;
   function scheduleRender() {
+    if (inFrame) { relayFrame(); return; }
     if (renderT) return;
     renderT = setTimeout(() => {
       renderT = null;
       if (!ui) ensureUI();
       cleanupPlayers();
       renderAll();
+      renderCapture();
     }, 220);
   }
 
-  function watchPlayers() {
-    const h = (e) => {
-      const t = e?.target;
-      if (t && (t.tagName === 'VIDEO' || t.tagName === 'AUDIO')) trackPlayer(t, 'event:' + e.type);
+  function domAll(selector) {
+    const nodes = [];
+    for (const root of roots) {
+      if (root !== document && !root.host?.isConnected) { roots.delete(root); continue; }
+      try { nodes.push(...root.querySelectorAll(selector)); } catch {}
+    }
+    return nodes;
+  }
+
+  function watchRoot(root) {
+    if (watched.has(root)) return;
+    watched.add(root);
+    roots.add(root);
+    let timer = null;
+    const changed = list => {
+      if (list.every(item => item.target === ui?.root || item.target?.getRootNode?.() === ui?.host || item.target === document.documentElement && Array.from(item.addedNodes || []).every(node => node === ui?.root))) return;
+      if (timer) return;
+      timer = setTimeout(() => { timer = null; scanDom(); cleanupPlayers(); }, 350);
     };
-    document.addEventListener('play', h, true);
-    document.addEventListener('loadedmetadata', h, true);
-    document.addEventListener('emptied', h, true);
-    document.addEventListener('durationchange', h, true);
+    const mo = new MutationObserver(changed);
+    try { mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'srcset', 'poster', 'style', 'data-src', 'data-href', 'data-url', 'data-image', 'data-img', 'data-original', 'data-lazy-src', 'data-thumb', 'data-thumbnail', 'data-poster', 'data-srcset'] }); } catch {}
+    const handler = event => {
+      if (/^(VIDEO|AUDIO)$/.test(event.target?.tagName || '')) trackPlayer(event.target, 'event:' + event.type);
+    };
+    for (const event of ['play', 'loadedmetadata', 'emptied', 'durationchange']) root.addEventListener(event, handler, true);
+  }
 
-    let moT = null;
-    const mo = new MutationObserver(() => {
-      if (moT) return;
-      moT = setTimeout(() => {
-        moT = null;
-        scanDom();
-        cleanupPlayers();
-      }, 250);
-    });
-
+  function watchPlayers() {
+    watchRoot(document);
     try {
-      mo.observe(document.documentElement || document, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['src', 'href', 'srcset', 'poster', 'style', 'data-src', 'data-href', 'data-url', 'data-image', 'data-img', 'data-original', 'data-lazy-src', 'data-thumb', 'data-thumbnail', 'data-poster', 'data-srcset']
+      const proto = page.Element.prototype;
+      const orig = proto.attachShadow;
+      if (orig) proto.attachShadow = pageFn(function () {
+        const root = orig.apply(this, arguments);
+        if (arguments[0]?.mode === 'open' && this.id !== '__mf_root__' && roots.size < 100) watchRoot(root);
+        return root;
       });
-    } catch { }
+      for (const el of Array.from(document.querySelectorAll('*')).slice(0, 10000)) if (el.shadowRoot && el.id !== '__mf_root__') watchRoot(el.shadowRoot);
+    } catch {}
+  }
+
+  function relayFrame() {
+    if (!inFrame || relayTimer) return;
+    relayTimer = setTimeout(() => {
+      relayTimer = null;
+      try {
+        const items = Array.from(found).slice(-500).map(([url, meta]) => ({ url, mime: meta.mime, size: meta.size, note: meta.note, kind: meta.kind, mse: !!meta.mse }));
+        const list = Array.from(players).filter(([el]) => el.isConnected).map(([el, info]) => ({ id: info.id, tag: info.tag, src: info.src, protected: info.protected, paused: el.paused }));
+        window.top.postMessage({ channel: CHANNEL, type: 'snapshot', page: location.href, items, players: list, recording: !!rec, status: statusText }, '*');
+      } catch {}
+    }, 500);
+  }
+
+  function isFrameSource(source) {
+    const scan = (doc, depth) => {
+      if (depth > 5) return false;
+      const frames = doc === document ? domAll('iframe,frame') : Array.from(doc.querySelectorAll('iframe,frame'));
+      for (const frame of frames) {
+        if (frame.contentWindow === source) return true;
+        try { if (frame.contentDocument && scan(frame.contentDocument, depth + 1)) return true; } catch {}
+      }
+      return false;
+    };
+    try { return scan(document, 0); } catch { return false; }
+  }
+
+  function sendFrame(source, origin, type, extra = {}) {
+    try { source.postMessage({ channel: CHANNEL, type, ...extra }, origin === 'null' ? '*' : origin); } catch {}
+  }
+
+  function installFrameRelay() {
+    window.addEventListener('message', event => {
+      const msg = event.data;
+      if (!msg || msg.channel !== CHANNEL) return;
+      if (inFrame) {
+        if (event.source !== window.top) return;
+        if (msg.type === 'record') {
+          const entry = Array.from(players).find(([, info]) => info.id === msg.id);
+          if (entry) startRecord('player', false, entry[0]);
+          else setStatus('The embedded player was removed. Rescan and select its current player.');
+        } else if (msg.type === 'stop') stopRecord();
+        else if (msg.type === 'pause') pauseRecord();
+        else if (msg.type === 'scan') scanDom();
+        return;
+      }
+      if (!isFrameSource(event.source)) return;
+      if (msg.type === 'snapshot') {
+        const old = frameInfo.get(event.source);
+        if (frameInfo.size >= 50 && !old) return;
+        const list = Array.isArray(msg.players) ? msg.players.slice(0, 100).filter(item => /^(video|audio)$/.test(item?.tag) && typeof item.id === 'string') : [];
+        const info = { id: old?.id || 'f' + (++playerSeq), source: event.source, origin: event.origin, page: String(msg.page || '').slice(0, 2048), players: list, last: now() };
+        frameInfo.set(event.source, info);
+        for (const item of (Array.isArray(msg.items) ? msg.items : []).slice(0, 500)) {
+          if (!item || typeof item.url !== 'string' || item.url.length > 16000) continue;
+          const url = norm(item.url);
+          if (!url || !/^https?:|^blob:/i.test(url)) continue;
+          add(url, { from: 'frame:' + event.origin, mime: String(item.mime || '').slice(0, 200), hintType: normalizeType(item.kind), note: String(item.note || '').slice(0, 200), size: Math.max(0, Number(item.size) || 0), referrer: info.page, frame: info.id, mse: !!item.mse });
+        }
+        if (rec?.remote === event.source) {
+          if (msg.recording) { rec.started = true; rec.pending = false; }
+          else if (rec.pending && now() - rec.time > 2000 && msg.status) { rec = null; setStatus(String(msg.status).slice(0, 500)); }
+          else if (msg.status && rec.started) setStatus(String(msg.status).slice(0, 500));
+        }
+        scheduleRender();
+      } else if (msg.type === 'record-result' && rec?.remote === event.source) {
+        const current = rec;
+        clearTimeout(current.timer);
+        rec = null;
+        if (msg.blob instanceof Blob && msg.blob.size > 0 && msg.blob.size <= CFG.maxMemoryBytes) {
+          saveBlob(msg.blob, String(msg.name || 'recording.webm'));
+          setStatus(String(msg.status || 'Recording saved.').slice(0, 500));
+        } else setStatus(String(msg.status || 'The embedded player produced no recording.').slice(0, 500));
+        renderCapture();
+      }
+    });
   }
 
   function installHooks() {
@@ -3565,8 +4639,93 @@
     patchXHR();
     patchMediaSource();
     patchSetSrcAttr();
+    installFrameRelay();
 
     observeResources();
+  }
+
+  function renderSavedFiles() {
+    if (!ui?.files) return;
+    const prior = ui.files.value;
+    ui.files.hidden = savedFiles.length < 2;
+    ui.files.replaceChildren();
+    for (let i = 0; i < savedFiles.length; i++) ui.files.add(new Option(savedFiles[i].name, String(i)));
+    ui.files.value = prior && savedFiles[Number(prior)] ? prior : String(Math.max(0, savedFiles.length - 1));
+  }
+
+  function renderCapture() {
+    if (inFrame) { relayFrame(); return; }
+    if (!ui?.player) return;
+    if (rec?.remote && !isFrameSource(rec.remote)) { clearTimeout(rec.timer); rec = null; setStatus('The embedded player was removed. Its recording connection ended.'); }
+    const list = playerEntries();
+    const prior = ui.player.value;
+    const sig = list.map(entry => [entry.id, entry.info.src, entry.info.protected].join('|')).join('\n');
+    if (ui.player.dataset.sig !== sig) {
+      ui.player.dataset.sig = sig;
+      ui.player.replaceChildren();
+      if (!list.length) ui.player.add(new Option('No player found — press play', ''));
+      for (const entry of list) {
+        let label = `${entry.info.tag === 'audio' ? 'Audio' : 'Video'} ${entry.id}`;
+        try { if (entry.info.src && !entry.info.src.startsWith('blob:')) label += ' · ' + new URL(entry.info.src).hostname; }
+        catch {}
+        if (entry.frame) label += ' · embedded';
+        if (entry.info.protected) label += ' · DRM';
+        else if (!entry.info.src || entry.info.src.startsWith('blob:')) label += ' · player stream';
+        ui.player.add(new Option(label, entry.id));
+      }
+      if (list.some(entry => entry.id === prior)) ui.player.value = prior;
+      else {
+        const playing = list.find(entry => entry.el ? !entry.el.paused : !entry.info.paused);
+        if (playing) ui.player.value = playing.id;
+      }
+    }
+    ui.capture.querySelector('summary').textContent = `Players & recording (${list.length})`;
+    const selected = list.find(entry => entry.id === ui.player.value);
+    ui.record.disabled = !!rec || !!job || !selected || !!selected.info.protected;
+    ui.player.disabled = !!rec;
+    ui.tabrecord.disabled = !!rec || !!job || !!selected?.info.protected;
+    ui.tabrecord.hidden = typeof navigator.mediaDevices?.getDisplayMedia !== 'function';
+    ui.recordfile.hidden = typeof page.showSaveFilePicker !== 'function' || !!selected?.frame;
+    ui.recordfile.disabled = ui.record.disabled;
+    ui.stop.hidden = !rec;
+    ui.pause.hidden = !rec || !!rec.pending;
+    ui.pause.textContent = rec?.paused ? 'Resume recording' : 'Pause recording';
+    ui.recbar.hidden = !rec;
+    if (rec?.remote) renderRecordStatus(rec);
+    if (ui.cancel) ui.cancel.hidden = !job;
+    if (ui.save) ui.save.hidden = !savedBlob;
+  }
+
+  function bindCapture() {
+    ui.record.onclick = () => startRecord('player');
+    ui.recordfile.onclick = () => startRecord('player', true);
+    ui.tabrecord.onclick = () => startRecord('tab');
+    ui.stop.onclick = () => stopRecord();
+    ui.pause.onclick = () => pauseRecord();
+    ui.recbar.querySelector('button').onclick = () => stopRecord();
+    ui.cancel.onclick = () => job?.ctrl.abort();
+    ui.save.onclick = () => { const file = savedFiles[Number(ui.files.value)] || savedBlob; if (file) saveBlob(file.blob, file.name); };
+    ui.player.onchange = () => renderCapture();
+    ui.quality.onchange = () => { quality = Number(ui.quality.value) || 0; };
+    const row = ui.q.parentElement;
+    const options = [ui.compact, ui.layout, ui.toastToggle, ui.clear];
+    const update = () => {
+      const mobile = matchMedia('(max-width: 950px), (pointer: coarse)').matches;
+      if (ui.mobileOpts !== mobile) {
+        ui.mobileOpts = mobile;
+        for (const option of options) (mobile ? ui.customizer : row).appendChild(option);
+      }
+      const view = window.visualViewport;
+      ui.root.style.setProperty('--mf-view-height', (view?.height || innerHeight) + 'px');
+      ui.root.style.setProperty('--mf-view-width', (view?.width || innerWidth) + 'px');
+      ui.root.style.setProperty('--mf-view-top', (view?.offsetTop || 0) + 'px');
+      ui.root.style.setProperty('--mf-view-left', (view?.offsetLeft || 0) + 'px');
+    };
+    window.visualViewport?.addEventListener('resize', update);
+    window.visualViewport?.addEventListener('scroll', update);
+    window.addEventListener('resize', update);
+    update();
+    renderCapture();
   }
 
   function start() {
@@ -3583,8 +4742,7 @@
       scheduleRender();
     }, CFG.scanIntervalMs);
 
-    ensureUI();
-    renderAll();
+    if (!inFrame) { ensureUI(); renderAll(); }
   }
 
   installHooks();
