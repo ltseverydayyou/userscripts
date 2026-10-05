@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Media Finder
 // @namespace    http://tampermonkey.net/
-// @version      1.9.1
+// @version      1.9.2
 // @description  Find and download media, HLS with served AES-128 keys, clear DASH, and record players with mobile-friendly controls
 // @match        *://*/*
 // @run-at       document-start
@@ -135,6 +135,7 @@
   let listSig = '';
   let statusText = '';
   let quality = 0;
+  let recStart = true;
 
   let ui = null;
   let uiOpen = false;
@@ -2895,6 +2896,7 @@
               <summary>Players &amp; recording</summary>
               <div class="mf_capturecontrols">
                 <select class="mf_sel" id="__mf_player__" aria-label="Select a detected player"></select>
+                <label>Recording starts <select class="mf_sel" id="__mf_recstart__"><option value="start">Beginning — full video</option><option value="current">Current position</option></select></label>
                 <button class="mf_iconbtn" id="__mf_record__">Record player</button>
                 <button class="mf_iconbtn" id="__mf_tabrecord__">Record tab / screen</button>
                 <button class="mf_iconbtn" id="__mf_recordfile__" hidden>Record to file</button>
@@ -2902,7 +2904,7 @@
                 <button class="mf_iconbtn" id="__mf_stop__" hidden>Stop &amp; save</button>
                 <label>Stream quality <select class="mf_sel" id="__mf_quality__"><option value="0">Best available</option><option value="1080">Up to 1080p</option><option value="720">Up to 720p</option><option value="480">Up to 480p</option></select></label>
               </div>
-              <p>Press play first. Recording saves from the current position. Downloads with separate audio save two files; recording makes one file.</p>
+              <p>Press play first. Beginning records a seekable video at normal speed. Live players record from the current position. Stop &amp; save ends the recording early. Downloads with separate audio save two files; recording makes one file.</p>
             </details>
             <div class="mf_tip" id="__mf_tip__">${t('tip')}</div>
             <div class="mf_listwrap" id="__mf_list__"></div>
@@ -2977,6 +2979,7 @@
       files: backdrop.querySelector('#__mf_files__'),
       capture: backdrop.querySelector('#__mf_capture__'),
       player: backdrop.querySelector('#__mf_player__'),
+      recstart: backdrop.querySelector('#__mf_recstart__'),
       record: backdrop.querySelector('#__mf_record__'),
       tabrecord: backdrop.querySelector('#__mf_tabrecord__'),
       recordfile: backdrop.querySelector('#__mf_recordfile__'),
@@ -3584,13 +3587,14 @@
     });
   }
 
-  function requestHeaders(url, base, range, gm) {
+  function requestHeaders(url, base, range, gm, validator) {
     const exact = reqInfo.get(url) || found.get(url) || {};
     const parent = reqInfo.get(base) || found.get(base) || {};
     const same = base && new URL(url).origin === new URL(base).origin;
     const headers = safeHeaders(exact.headers || (same ? parent.headers : {}));
     for (const key of Object.keys(headers)) if (key.toLowerCase() === 'range') delete headers[key];
     if (range) headers.Range = `bytes=${range.start}-${range.end}`;
+    if (range && validator && !/[\r\n]/.test(validator)) headers['If-Range'] = validator;
     if (gm) headers.Referer = exact.referrer || parent.referrer || location.href;
     return headers;
   }
@@ -3614,6 +3618,21 @@
     return error;
   }
 
+  function partReply(data, mime, url, status, header, length, encoded, etag, modified) {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (!bytes.length) throw new Error('The media response is empty.');
+    if (!encoded && /^\d+$/.test(String(length || '')) && bytes.length !== Number(length)) throw new Error('The server returned an incomplete response.');
+    let range = null;
+    if (status === 206) {
+      const match = String(header || '').match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+      if (!match) throw new Error('The partial response has no valid Content-Range.');
+      const start = Number(match[1]), end = Number(match[2]), total = match[3] === '*' ? null : Number(match[3]);
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start || bytes.length !== end - start + 1 || total !== null && (!Number.isSafeInteger(total) || total <= end)) throw new Error('The server returned an invalid byte range.');
+      range = { start, end, total };
+    }
+    return { data: bytes, mime, url, status, range, validator: etag && !/^W\//i.test(etag) ? etag : modified || '' };
+  }
+
   async function fetchBytes(url, opts) {
     if (!rawFetch) throw new Error('Browser fetch is unavailable.');
     const ctrl = new AbortController();
@@ -3622,7 +3641,7 @@
     const timer = setTimeout(cancel, 30000);
     try {
       checkAbort(opts.signal);
-      const resp = await rawFetch(url, { credentials: 'include', headers: requestHeaders(url, opts.base, opts.range, false), signal: ctrl.signal });
+      const resp = await rawFetch(url, { credentials: 'include', headers: requestHeaders(url, opts.base, opts.range, false, opts.validator), signal: ctrl.signal });
       if (!resp.ok) throw httpError(resp.status, url);
       const limit = opts.limit || CFG.maxMemoryBytes;
       if (Number(resp.headers.get('content-length')) > limit) {
@@ -3653,7 +3672,7 @@
       const all = new Uint8Array(total);
       let at = 0;
       for (const bytes of chunks) { all.set(bytes, at); at += bytes.byteLength; }
-      return { data: rangeData(all, opts.range, resp.status, resp.headers.get('content-range')), mime: resp.headers.get('content-type') || '', url: resp.url || url };
+      return partReply(all, resp.headers.get('content-type') || '', resp.url || url, resp.status, resp.headers.get('content-range'), resp.headers.get('content-length'), resp.headers.get('content-encoding'), resp.headers.get('etag'), resp.headers.get('last-modified'));
     } finally { clearTimeout(timer); opts.signal?.removeEventListener('abort', cancel); }
   }
 
@@ -3676,7 +3695,7 @@
       try {
         handle = GM_xmlhttpRequest({
           method: 'GET', url, responseType: 'arraybuffer', timeout: 30000,
-          headers: requestHeaders(url, opts.base, opts.range, true),
+          headers: requestHeaders(url, opts.base, opts.range, true, opts.validator),
           onprogress: value => {
             if (value.loaded > (opts.limit || CFG.maxMemoryBytes)) {
               handle?.abort?.();
@@ -3688,9 +3707,8 @@
               if (resp.status < 200 || resp.status >= 300) throw httpError(resp.status, url);
               if (!resp.response || resp.response.byteLength > (opts.limit || CFG.maxMemoryBytes)) throw new Error('The response is empty or exceeds the memory limit.');
               const headers = String(resp.responseHeaders || '');
-              const mime = headers.match(/^content-type:\s*([^\r\n]+)/im)?.[1] || '';
-              const range = headers.match(/^content-range:\s*([^\r\n]+)/im)?.[1] || '';
-              finish(null, { data: rangeData(resp.response, opts.range, resp.status, range), mime, url: resp.finalUrl || url });
+              const header = key => headers.match(new RegExp('^' + key + ':\\s*([^\\r\\n]+)', 'im'))?.[1] || '';
+              finish(null, partReply(resp.response, header('content-type'), resp.finalUrl || url, resp.status, header('content-range'), header('content-length'), header('content-encoding'), header('etag'), header('last-modified')));
             } catch (error) { finish(error); }
           },
           onerror: () => finish(new Error('Cross-origin request failed. Check the userscript manager’s connection permission.')),
@@ -3701,7 +3719,7 @@
     });
   }
 
-  async function requestBytes(url, opts = {}) {
+  async function pullBytes(url, opts = {}) {
     checkAbort(opts.signal);
     let last;
     let target = url;
@@ -3725,11 +3743,56 @@
     throw last || new Error('The media could not be fetched.');
   }
 
+  async function requestBytes(url, opts = {}) {
+    const first = await pullBytes(url, opts);
+    if (!first.range) return { ...first, data: rangeData(first.data, opts.range, first.status, '') };
+    const start = opts.range?.start || 0;
+    const end = opts.range?.end ?? (first.range.total === null ? null : first.range.total - 1);
+    if (end === null) throw new Error('The server returned a partial file without its full size.');
+    const size = end - start + 1;
+    if (!Number.isSafeInteger(size) || size < 1 || size > (opts.limit || CFG.maxMemoryBytes)) throw new Error('The complete media file exceeds the memory limit.');
+    if (first.range.start === start && first.range.end === end) return first;
+    const all = new Uint8Array(size);
+    let at = start;
+    const copy = part => {
+      if (!part.range || part.range.start !== at || first.range.total !== null && part.range.total !== first.range.total || first.validator && part.validator && first.validator !== part.validator) throw new Error('The server returned a different file or the wrong byte range.');
+      const count = Math.min(part.data.length, end - at + 1);
+      all.set(part.data.subarray(0, count), at - start);
+      at += count;
+      opts.progress?.(at - start, size);
+    };
+    if (first.range.start === start) copy(first);
+    else if (opts.range) throw new Error('The server returned the wrong byte range.');
+    let parts = 0;
+    while (at <= end) {
+      checkAbort(opts.signal);
+      if (++parts > 8192) throw new Error('The server split the file into too many partial responses.');
+      const loaded = at - start;
+      const part = await pullBytes(url, {
+        ...opts, base: opts.base || url, validator: first.validator,
+        range: { start: at, end: Math.min(end, at + 4 * 1024 * 1024 - 1) },
+        progress: count => opts.progress?.(Math.min(size, loaded + count), size)
+      });
+      if (!part.range) return { ...part, data: rangeData(part.data, opts.range, part.status, '') };
+      copy(part);
+    }
+    checkAbort(opts.signal);
+    return { ...first, data: all, status: opts.range ? 206 : 200, range: null };
+  }
+
   function cleanName(name) { return String(name || 'media').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').slice(0, 180) || 'media'; }
 
   function outputName(url, suffix) {
     const name = cleanName(document.title || guessFileName(url) || 'media').replace(/\.(mp4|webm|m3u8|mpd|ts|aac|m4a)$/i, '');
     return `${name}.${suffix}`;
+  }
+
+  function mediaExt(bytes, mime) {
+    if (bytes.length >= 4 && bytes[0] === 0x1a && bytes[1] === 0x45 && bytes[2] === 0xdf && bytes[3] === 0xa3) return /matroska/i.test(mime) ? 'mkv' : 'webm';
+    if (bytes.length >= 8 && new TextDecoder().decode(bytes.subarray(4, 8)) === 'ftyp') return mime.startsWith('audio/') ? 'm4a' : 'mp4';
+    if (bytes.length >= 4 && new TextDecoder().decode(bytes.subarray(0, 4)) === 'OggS') return mime.startsWith('video/') ? 'ogv' : 'ogg';
+    if (bytes.length >= 377 && bytes[0] === 0x47 && bytes[188] === 0x47 && bytes[376] === 0x47) return 'ts';
+    return mime.includes('video/mp4') ? 'mp4' : /webm/i.test(mime) ? 'webm' : mime.includes('audio/mp4') ? 'm4a' : '';
   }
 
   function saveBlob(blob, name) {
@@ -4109,24 +4172,25 @@
         const tracks = /^\s*#EXTM3U/.test(manifest.text) ? await hlsTracks(manifest.text, manifest.url, task.ctrl.signal) : parseDash(manifest.text, manifest.url);
         await downloadTracks(tracks, url, task);
       } else {
-        let native = false;
-        if (/^https?:/i.test(url)) {
-          try { await nativeDownload(url, task); native = true; setStatus('Download finished.'); }
-          catch { checkAbort(task.ctrl.signal); setStatus('Trying a cross-origin media fetch…'); }
+        let result;
+        try { result = await requestBytes(url, { signal: task.ctrl.signal, progress: (loaded, total) => setStatus(`Fetching media · ${formatBytes(loaded)}${total ? ' / ' + formatBytes(total) : ''}`) }); }
+        catch (error) {
+          checkAbort(task.ctrl.signal);
+          if (!/^https?:/i.test(url) || !/memory limit|unavailable/i.test(error.message)) throw error;
+          await nativeDownload(url, task);
+          setStatus('Browser download finished.');
+          return;
         }
-        if (!native) {
-          const result = await requestBytes(url, { signal: task.ctrl.signal, progress: loaded => setStatus(`Fetching media · ${formatBytes(loaded)}`) });
-          if (/text\/html/i.test(result.mime)) throw new Error('The link returned a web page. Press play, rescan, or record the detected player.');
-          const isText = /mpegurl|dash\+xml/i.test(result.mime) || result.data.length < 2 * 1024 * 1024 && /^\s*#EXTM3U|<MPD[\s>]/i.test(new TextDecoder().decode(result.data.subarray(0, 200)));
-          if (isText) {
-            const text = new TextDecoder().decode(result.data);
-            const tracks = /^\s*#EXTM3U/.test(text) ? await hlsTracks(text, result.url, task.ctrl.signal) : parseDash(text, result.url);
-            await downloadTracks(tracks, url, task);
-          } else {
-            const suffix = /video\/mp4/i.test(result.mime) ? 'mp4' : /video\/webm/i.test(result.mime) ? 'webm' : /audio\/mp4/i.test(result.mime) ? 'm4a' : '';
-            saveBlob(new Blob([result.data], { type: result.mime || 'application/octet-stream' }), suffix ? outputName(url, suffix) : guessFileName(url));
-            setStatus('Download ready. If your mobile browser did not save it, tap Save again.');
-          }
+        if (/text\/html/i.test(result.mime)) throw new Error('The link returned a web page. Press play, rescan, or record the detected player.');
+        const isText = /mpegurl|dash\+xml/i.test(result.mime) || result.data.length < 2 * 1024 * 1024 && /^\s*#EXTM3U|<MPD[\s>]/i.test(new TextDecoder().decode(result.data.subarray(0, 200)));
+        if (isText) {
+          const text = new TextDecoder().decode(result.data);
+          const tracks = /^\s*#EXTM3U/.test(text) ? await hlsTracks(text, result.url, task.ctrl.signal) : parseDash(text, result.url);
+          await downloadTracks(tracks, url, task);
+        } else {
+          const suffix = mediaExt(result.data, result.mime);
+          saveBlob(new Blob([result.data], { type: result.mime || 'application/octet-stream' }), suffix ? outputName(url, suffix) : guessFileName(url));
+          setStatus('Download ready. If your mobile browser did not save it, tap Save again.');
         }
       }
     } catch (error) {
@@ -4151,8 +4215,96 @@
 
   function recordMime(stream) {
     const video = stream.getVideoTracks().length > 0;
-    const choices = video ? ['video/mp4', 'video/webm;codecs=vp8,opus', 'video/webm'] : ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg'];
+    const choices = video ? ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1.42001E,mp4a.40.2', 'video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4'] : ['audio/mp4;codecs=mp4a.40.2', 'audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/ogg', 'audio/mp4'];
     return choices.find(value => MediaRecorder.isTypeSupported(value)) || '';
+  }
+
+  function ebmlSize(value, width = 0) {
+    const n = BigInt(value);
+    if (!width) for (width = 1; width < 8 && n >= (1n << BigInt(7 * width)) - 1n; width++) {}
+    if (n < 0n || n >= (1n << BigInt(7 * width)) - 1n) throw new Error('Invalid WebM element size.');
+    const out = new Uint8Array(width);
+    let v = n;
+    for (let i = width - 1; i >= 0; i--) { out[i] = Number(v & 255n); v >>= 8n; }
+    out[0] |= 1 << (8 - width);
+    return out;
+  }
+
+  function ebmlPart(bytes, at) {
+    const vint = (pos, id) => {
+      const first = bytes[pos];
+      if (!first) throw new Error('Invalid WebM header.');
+      let width = 1, mark = 128;
+      while (!(first & mark) && width <= 8) { width++; mark >>= 1; }
+      if (width > (id ? 4 : 8) || pos + width > bytes.length) throw new Error('Incomplete WebM header.');
+      let n = BigInt(id ? first : first & (mark - 1));
+      for (let i = 1; i < width; i++) n = n * 256n + BigInt(bytes[pos + i]);
+      const unknown = !id && n === (1n << BigInt(7 * width)) - 1n;
+      if (!unknown && n > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('WebM header size exceeds browser limits.');
+      return { width, value: unknown ? null : Number(n) };
+    };
+    const id = vint(at, true);
+    const sizeAt = at + id.width;
+    const size = vint(sizeAt, false);
+    const dataAt = sizeAt + size.width;
+    return { id: id.value, at, sizeAt, sizeLen: size.width, dataAt, size: size.value, end: size.value === null ? bytes.length : dataAt + size.value };
+  }
+
+  function webmHead(bytes, secs) {
+    if (!(secs >= 0) || !Number.isFinite(secs)) throw new Error('Invalid recording duration.');
+    const ebml = ebmlPart(bytes, 0);
+    if (ebml.id !== 0x1a45dfa3) throw new Error('The recorder did not produce a valid WebM file.');
+    const seg = ebmlPart(bytes, ebml.end);
+    if (seg.id !== 0x18538067) throw new Error('The WebM recording has no media segment.');
+    let info, seek = false;
+    for (let at = seg.dataAt; at < bytes.length;) {
+      const item = ebmlPart(bytes, at);
+      if (item.id === 0x114d9b74) seek = true;
+      if (item.id === 0x1549a966) { info = item; break; }
+      if (item.id === 0x1f43b675 || item.end <= at || item.end > bytes.length) break;
+      at = item.end;
+    }
+    if (!info || info.end > bytes.length) throw new Error('The WebM recording has incomplete metadata.');
+    let scale = 1000000, dur, crc = false;
+    for (let at = info.dataAt; at < info.end;) {
+      const item = ebmlPart(bytes, at);
+      if (item.end > info.end || item.end <= at) throw new Error('Invalid WebM recording metadata.');
+      if (item.id === 0x2ad7b1) { scale = 0; for (let i = item.dataAt; i < item.end; i++) scale = scale * 256 + bytes[i]; }
+      if (item.id === 0x4489) dur = item;
+      if (item.id === 0xbf) crc = true;
+      at = item.end;
+    }
+    if (!(scale > 0) || crc || !dur && seek) throw new Error('This WebM metadata layout cannot be finalized safely.');
+    const value = secs * 1000000000 / scale;
+    if (dur) {
+      if (dur.size !== 4 && dur.size !== 8) throw new Error('Invalid WebM duration field.');
+      const head = bytes.slice(0, info.end);
+      const view = new DataView(head.buffer);
+      dur.size === 4 ? view.setFloat32(dur.dataAt, value) : view.setFloat64(dur.dataAt, value);
+      return { head, cut: info.end, pos: dur.dataAt, width: dur.size, scale };
+    }
+    const field = new Uint8Array(11);
+    field.set([0x44, 0x89, 0x88]);
+    new DataView(field.buffer).setFloat64(3, value);
+    const size = ebmlSize(info.size + field.length, info.sizeLen);
+    const head = new Uint8Array(info.end + field.length);
+    head.set(bytes.subarray(0, info.sizeAt));
+    head.set(size, info.sizeAt);
+    head.set(bytes.subarray(info.dataAt, info.end), info.dataAt);
+    head.set(field, info.end);
+    if (seg.size !== null) head.set(ebmlSize(seg.size + field.length, seg.sizeLen), seg.sizeAt);
+    return { head, cut: info.end, pos: info.end + 3, width: 8, scale };
+  }
+
+  async function fixWebm(blob, secs) {
+    const bytes = new Uint8Array(await blob.slice(0, 65536).arrayBuffer());
+    const meta = webmHead(bytes, secs);
+    return { blob: new Blob([meta.head, blob.slice(meta.cut)], { type: blob.type }), ...meta };
+  }
+
+  function recordSecs(current) {
+    const end = current.pauseAt || performance.now();
+    return Math.max(0, (end - current.clock - (current.pauseMs || 0)) / 1000);
   }
 
   async function waitTracks(stream, el, signal) {
@@ -4205,8 +4357,8 @@
 
   async function localRecordingStream(el, current) {
     const url = recordingSource(el);
-    const position = Math.max(0, Number(el.currentTime) || 0);
-    const rate = Number(el.playbackRate) || 1;
+    const position = current.fromStart ? 0 : Math.max(0, Number(el.currentTime) || 0);
+    const rate = current.fromStart ? 1 : Number(el.playbackRate) || 1;
     const signal = current.ctrl.signal;
     current.setupStatus = 'Player capture blocked. Fetching an accessible recording source…';
     renderRecordStatus(current);
@@ -4243,6 +4395,7 @@
     current.setupStatus = 'Preparing the fetched media for recording…';
     renderRecordStatus(current);
     await waitRecordMedia(local, signal);
+    current.expected = Number.isFinite(local.duration) ? Math.max(0, local.duration - position) / rate : 0;
     if (position > 0) {
       local.currentTime = Number.isFinite(local.duration) ? Math.min(position, Math.max(0, local.duration - 0.1)) : position;
       await waitRecordMedia(local, signal);
@@ -4253,7 +4406,6 @@
     if (typeof capture !== 'function') throw new Error('This browser cannot capture a locally fetched player.');
     const stream = capture.call(local);
     current.stream = stream;
-    await local.play();
     checkAbort(signal);
     return stream;
   }
@@ -4262,7 +4414,7 @@
     current.ctrl?.abort();
     clearInterval(current.timer);
     (current.localEl || current.el)?.removeEventListener('ended', current.stop);
-    for (const track of current.stream?.getTracks?.() || []) { track.removeEventListener('ended', current.stop); track.stop(); }
+    for (const track of current.stream?.getTracks?.() || []) { track.removeEventListener('ended', current.trackEnd || current.stop); track.stop(); }
     if (current.localEl) {
       current.localEl.pause();
       current.localEl.removeAttribute('src');
@@ -4271,9 +4423,10 @@
       current.localEl = null;
     }
     if (current.localURL) { URL.revokeObjectURL(current.localURL); current.localURL = null; }
+    if (current.loopEl) { current.loopEl.loop = current.origLoop; current.loopEl = null; }
   }
 
-  async function startRecord(mode, toFile = false, forcedEl, forcedEntry) {
+  async function startRecord(mode, toFile = false, forcedEl, forcedEntry, fromStart = recStart) {
     if (rec) { setStatus('A recording is already running. Use Stop & save first.'); return; }
     if (job) { setStatus('Finish or cancel the download before recording.'); return; }
     if (typeof MediaRecorder !== 'function') { setStatus('This browser does not support MediaRecorder. Try a browser with recording support.'); return; }
@@ -4289,7 +4442,7 @@
       current.timer = setTimeout(() => {
         if (rec === current && !current.started) { sendFrame(current.remote, current.origin, 'stop'); rec = null; setStatus('The embedded player did not start recording. Press play inside it and try again.'); renderCapture(); }
       }, 15000);
-      sendFrame(frame.source, frame.origin, 'record', { id: entry.info.id });
+      sendFrame(frame.source, frame.origin, 'record', { id: entry.info.id, fromStart });
       setStatus('Starting embedded player recording…');
       renderCapture();
       return;
@@ -4299,7 +4452,7 @@
     let stream;
     let writer;
     let handle;
-    const current = { time: now(), ctrl: new AbortController(), chunks: [], size: 0, el: mode === 'player' ? el : null, paused: false, pending: true, setupStatus: 'Starting recording…', writes: Promise.resolve(), finishing: false, reason: '' };
+    const current = { time: now(), ctrl: new AbortController(), fromStart, chunks: [], size: 0, el: mode === 'player' ? el : null, paused: false, pending: true, setupStatus: 'Starting recording…', writes: Promise.resolve(), finishing: false, reason: '' };
     rec = current;
     savedBlob = null;
     savedFiles = [];
@@ -4327,10 +4480,24 @@
             current.captureBlocked = true;
             stream = await localRecordingStream(el, current);
           }
+          current.stream = stream;
+          if (!current.localEl && fromStart && Number.isFinite(el.duration) && el.duration > 0 && el.seekable?.length && el.seekable.start(0) < 0.1) {
+            current.loopEl = el;
+            current.origLoop = el.loop;
+            el.loop = false;
+            el.pause();
+            el.currentTime = 0;
+            el.playbackRate = 1;
+            await waitRecordMedia(el, current.ctrl.signal);
+            for (const track of stream.getTracks()) track.stop();
+            stream = capture.call(el);
+            current.expected = el.duration;
+          } else if (!current.localEl && Number.isFinite(el.duration)) current.expected = Math.max(0, el.duration - el.currentTime) / (el.playbackRate || 1);
         }
         else throw new Error('This browser cannot capture this player directly. ' + recordingFallbackHint());
         current.stream = stream;
-        if (!current.localEl && el.paused) await el.play();
+        const playback = current.localEl || el;
+        if (playback.paused) await playback.play();
       }
       current.stream = stream;
       if (rec !== current || current.cancelled) throw abortError();
@@ -4339,21 +4506,35 @@
       if (handle) { writer = await handle.createWritable(); current.writer = writer; }
       checkAbort(current.ctrl.signal);
       const mime = recordMime(stream);
-      const recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      const video = stream.getVideoTracks()[0];
+      const settings = video?.getSettings?.() || {};
+      const rate = video ? Math.min(12000000, Math.max(1000000, (settings.width || el?.videoWidth || 1280) * (settings.height || el?.videoHeight || 720) * (settings.frameRate || 30) * 0.15)) : 0;
+      const recorder = new MediaRecorder(stream, { ...(mime ? { mimeType: mime } : {}), ...(video ? { videoBitsPerSecond: rate } : {}), audioBitsPerSecond: 128000 });
       current.recorder = recorder;
       current.ext = /mp4/i.test(recorder.mimeType) ? stream.getVideoTracks().length ? 'mp4' : 'm4a' : /ogg/i.test(recorder.mimeType) ? 'ogg' : 'webm';
       current.mime = recorder.mimeType || mime || 'video/webm';
       current.pending = false;
       current.time = now();
+      current.clock = performance.now();
+      current.rate = (recorder.videoBitsPerSecond || rate || 0) + (stream.getAudioTracks().length ? recorder.audioBitsPerSecond || 128000 : 0);
       current.name = outputName(location.href, 'recording.' + current.ext);
-      current.stop = () => stopRecord();
+      current.stop = () => { if (rec === current) stopRecord(); };
       (current.localEl || current.el)?.addEventListener('ended', current.stop, { once: true });
-      for (const track of stream.getTracks()) track.addEventListener('ended', current.stop, { once: true });
+      current.trackEnd = () => { if (rec === current && stream.getTracks().every(track => track.readyState === 'ended')) stopRecord(); };
+      for (const track of stream.getTracks()) track.addEventListener('ended', current.trackEnd, { once: true });
       recorder.ondataavailable = event => {
         if (!event.data?.size) return;
         current.size += event.data.size;
+        if (event.data.type) current.mime = event.data.type;
         if (writer) {
-          current.writes = current.writes.then(() => writer.write(event.data)).catch(error => {
+          current.writes = current.writes.then(async () => {
+            let data = event.data;
+            if (!current.header) {
+              current.header = true;
+              if (/webm/i.test(current.mime)) { const meta = await fixWebm(data, 0); current.webm = { pos: meta.pos, width: meta.width, scale: meta.scale }; data = meta.blob; }
+            }
+            await writer.write(data);
+          }).catch(error => {
             current.writeError = error;
             current.reason = 'The output file could not be written: ' + error.message;
             stopRecord(current.reason);
@@ -4364,11 +4545,12 @@
         }
       };
       recorder.onerror = event => stopRecord('The recorder failed: ' + (event.error?.message || 'unknown error'));
-      recorder.onstop = () => finishRecord(current);
-      recorder.start(1000);
+      recorder.onstop = () => { current.duration ??= recordSecs(current); finishRecord(current); };
+      writer ? recorder.start(1000) : recorder.start();
       current.timer = setInterval(() => {
-        if (current.el && !current.el.isConnected) stopRecord('The player was removed. The recorded part was saved.');
-        else if (current.el?.mediaKeys || players.get(current.el)?.protected) stopRecord('DRM was detected. Recording stopped.');
+        if (!current.localEl && current.el && !current.el.isConnected) stopRecord('The player was removed. The recorded part was saved.');
+        else if (!current.localEl && (current.el?.mediaKeys || players.get(current.el)?.protected)) stopRecord('DRM was detected. Recording stopped.');
+        else if (!writer && recordSecs(current) * current.rate / 8 * 1.5 > (current.memoryLimit || CFG.maxMemoryBytes) - 8 * 1024 * 1024) stopRecord('The recording reached the memory limit. The recorded part was saved. Use Record to file for longer videos.');
         else renderRecordStatus(current);
       }, 1000);
       if (ui?.capture) ui.capture.open = true;
@@ -4389,8 +4571,9 @@
   }
 
   function renderRecordStatus(current) {
-    const secs = Math.floor((now() - current.time) / 1000);
-    const label = current.pending ? current.setupStatus || 'Starting recording…' : current.remote && current.remoteStatus ? current.remoteStatus : `${current.paused ? 'Recording paused' : current.localEl ? 'Recording fetched copy' : 'Recording'} · ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} · ${formatBytes(current.size || 0)}${current.stream && !current.stream.getAudioTracks().length ? ' · no audio track' : ''}${current.writer ? ' · saving to file' : ''}`;
+    const secs = Math.floor(current.clock ? recordSecs(current) : (now() - current.time) / 1000);
+    const bytes = current.size || (current.clock ? recordSecs(current) * (current.rate || 0) / 8 : 0);
+    const label = current.pending ? current.setupStatus || 'Starting recording…' : current.remote && current.remoteStatus ? current.remoteStatus : `${current.paused ? 'Recording paused' : current.localEl ? 'Recording fetched copy' : 'Recording'} · ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} · ${!current.size && !current.writer ? '~' : ''}${formatBytes(bytes)}${current.stream && !current.stream.getAudioTracks().length ? ' · no audio track' : ''}${current.writer ? ' · saving to file' : ''}`;
     setStatus(label);
     if (ui?.recbar) { ui.recbar.hidden = false; ui.recbar.querySelector('span').textContent = label; }
   }
@@ -4411,16 +4594,19 @@
       renderCapture();
       return;
     }
+    current.duration ??= recordSecs(current);
     if (current.recorder?.state !== 'inactive') current.recorder.stop();
   }
 
   function pauseRecord() {
     if (!rec || rec.pending) return;
     if (rec.remote) { sendFrame(rec.remote, rec.origin, 'pause'); rec.paused = !rec.paused; }
-    else if (rec.recorder.state === 'recording') { rec.recorder.pause(); rec.localEl?.pause(); rec.paused = true; }
+    else if (rec.recorder.state === 'recording') { rec.recorder.pause(); rec.localEl?.pause(); rec.pauseAt = performance.now(); rec.paused = true; }
     else if (rec.recorder.state === 'paused') {
       const current = rec;
       current.recorder.resume();
+      current.pauseMs = (current.pauseMs || 0) + performance.now() - current.pauseAt;
+      current.pauseAt = 0;
       current.paused = false;
       current.localEl?.play().catch(error => { if (rec === current) stopRecord('The fetched media could not resume: ' + error.message); });
     }
@@ -4437,12 +4623,24 @@
     try {
       await current.writes;
       if (current.writeError) throw current.writeError;
-      if (current.writer) { await current.writer.close(); text = current.reason || 'Recording saved to the selected file.'; }
+      if (current.writer) {
+        if (current.webm) {
+          const meta = current.webm;
+          const data = new Uint8Array(meta.width);
+          const value = current.duration * 1000000000 / meta.scale;
+          meta.width === 4 ? new DataView(data.buffer).setFloat32(0, value) : new DataView(data.buffer).setFloat64(0, value);
+          await current.writer.write({ type: 'write', position: meta.pos, data });
+          current.webm = null;
+        }
+        await current.writer.close(); text = current.reason || 'Recording saved to the selected file.';
+      }
       else {
         blob = new Blob(current.chunks, { type: current.mime });
+        if (blob.size && /webm/i.test(current.mime)) blob = (await fixWebm(blob, current.duration)).blob;
         text = blob.size ? current.reason || 'Recording ready. If your mobile browser did not save it, tap Save again.' : current.reason || 'The player produced no recording data. Try Record tab / screen.';
       }
-    } catch (error) { await current.writer?.abort().catch(() => {}); text = 'The recording file could not be saved: ' + error.message; }
+      if (current.expected > 0 && current.duration < current.expected - 0.4) text = `Recorded ${current.duration.toFixed(1)}s of the ${current.expected.toFixed(1)}s video. ${text}`;
+    } catch (error) { blob = null; await current.writer?.abort().catch(() => {}); text = 'The recording file could not be saved: ' + error.message; }
     current.chunks.length = 0;
     if (rec === current) rec = null;
     if (inFrame) window.top.postMessage({ channel: CHANNEL, type: 'record-result', blob, name: current.name, status: text }, '*');
@@ -4735,7 +4933,7 @@
         if (event.source !== window.top) return;
         if (msg.type === 'record') {
           const entry = Array.from(players).find(([, info]) => info.id === msg.id);
-          if (entry) startRecord('player', false, entry[0]);
+          if (entry) startRecord('player', false, entry[0], undefined, msg.fromStart !== false);
           else setStatus('The embedded player was removed. Rescan and select its current player.');
         } else if (msg.type === 'stop') stopRecord();
         else if (msg.type === 'pause') pauseRecord();
@@ -4832,6 +5030,7 @@
     const selected = list.find(entry => entry.id === ui.player.value);
     ui.record.disabled = !!rec || !!job || !selected || !!selected.info.protected;
     ui.player.disabled = !!rec;
+    ui.recstart.disabled = !!rec || !!job;
     ui.tabrecord.disabled = !!rec || !!job || !!selected?.info.protected;
     ui.tabrecord.hidden = typeof navigator.mediaDevices?.getDisplayMedia !== 'function';
     ui.recordfile.hidden = typeof page.showSaveFilePicker !== 'function' || !!selected?.frame;
@@ -4858,6 +5057,7 @@
     ui.save.onclick = () => { const file = savedFiles[Number(ui.files.value)] || savedBlob; if (file) saveBlob(file.blob, file.name); };
     ui.player.onchange = () => renderCapture();
     ui.quality.onchange = () => { quality = Number(ui.quality.value) || 0; };
+    ui.recstart.onchange = () => { recStart = ui.recstart.value !== 'current'; };
     const row = ui.q.parentElement;
     const options = [ui.compact, ui.layout, ui.toastToggle, ui.clear];
     const update = () => {

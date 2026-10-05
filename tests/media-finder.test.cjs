@@ -6,14 +6,14 @@ const { webcrypto, createCipheriv } = require('node:crypto');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'media finder.user.js'), 'utf8').replace(/\r\n/g, '\n');
-const names = ['parseHls', 'ivBytes', 'byteRange', 'rangeData', 'dashUrl', 'durationSecs', 'pickQuality', 'decryptPart', 'requestHeaders', 'rememberReq', 'safeHeaders', 'parseYoutubeCipherUrl', 'norm', 'recordingSource', 'waitRecordMedia', 'waitTracks', 'cleanRecordSource'];
+const names = ['parseHls', 'ivBytes', 'byteRange', 'rangeData', 'dashUrl', 'durationSecs', 'pickQuality', 'decryptPart', 'requestHeaders', 'rememberReq', 'safeHeaders', 'parseYoutubeCipherUrl', 'norm', 'recordingSource', 'waitRecordMedia', 'waitTracks', 'cleanRecordSource', 'requestBytes', 'partReply', 'ebmlPart', 'ebmlSize', 'webmHead', 'fixWebm', 'recordMime', 'recordSecs', 'mediaExt'];
 const tail = "  installHooks();\n  if (document.readyState === 'loading')";
 assert.ok(source.includes(tail));
 
 function load(fetch, overrides = {}) {
   const window = { fetch };
   window.top = window.self = window;
-  const context = vm.createContext({ window, document: {}, navigator: {}, location: new URL('https://lesson.test/watch'), matchMedia: () => ({ matches: false }), globalThis: null, URL, URLSearchParams, TextDecoder, Uint8Array, AbortController, DOMException, crypto: webcrypto, setTimeout, clearTimeout, setInterval, clearInterval, ...overrides });
+  const context = vm.createContext({ window, document: {}, navigator: {}, location: new URL('https://lesson.test/watch'), matchMedia: () => ({ matches: false }), globalThis: null, URL, URLSearchParams, Blob, TextDecoder, Uint8Array, AbortController, DOMException, crypto: webcrypto, setTimeout, clearTimeout, setInterval, clearInterval, ...overrides });
   context.globalThis = context;
   vm.runInContext(source.slice(0, source.indexOf(tail)) + `globalThis.api = { ${names.join(',')}, seedFound: (url, meta) => found.set(url, meta) };\n})();`, context);
   return context.api;
@@ -199,4 +199,78 @@ test('recording cleanup releases its temporary source without changing the origi
   assert.equal(current.localEl, null);
   assert.equal(current.localURL, null);
   assert.deepEqual(original, {src:'https://cdn.test/original.mp4',paused:false});
+});
+
+test('full downloads assemble capped partial responses and send the file validator', async () => {
+  const bytes = Uint8Array.from({length:17}, (_, i) => i);
+  const calls = [];
+  const testApi = load(async (url, opts) => {
+    calls.push(opts.headers);
+    const req = opts.headers.Range?.match(/bytes=(\d+)-(\d+)/);
+    const start = req ? Number(req[1]) : 0;
+    const end = Math.min(start + 3, req ? Number(req[2]) : 3, bytes.length - 1);
+    return new Response(bytes.slice(start, end + 1), {status:206,headers:{'Content-Range':`bytes ${start}-${end}/${bytes.length}`,ETag:'"lesson"'}});
+  });
+  const progress = [];
+  const result = await testApi.requestBytes('https://cdn.test/video', {progress:(loaded,total)=>progress.push([loaded,total])});
+  assert.deepEqual(Buffer.from(result.data), Buffer.from(bytes));
+  assert.ok(calls.length > 1);
+  assert.ok(calls.slice(1).every(h=>h['If-Range']==='"lesson"'));
+  assert.deepEqual(progress.at(-1), [17,17]);
+});
+
+test('a full response that ignores a continuation Range replaces the partial download', async () => {
+  const bytes = Uint8Array.from({length:20}, (_,i)=>i);
+  let calls = 0;
+  const testApi = load(async()=>++calls===1 ? new Response(bytes.slice(0,4), {status:206,headers:{'Content-Range':'bytes 0-3/20'}}) : new Response(bytes));
+  const result = await testApi.requestBytes('https://cdn.test/video');
+  assert.deepEqual(Buffer.from(result.data), Buffer.from(bytes));
+  assert.equal(calls, 2);
+});
+
+test('downloads reject unknown full length, changing files, missing ranges and total-size overflow', async () => {
+  const unknown = load(async()=>new Response(Uint8Array.of(1,2), {status:206,headers:{'Content-Range':'bytes 0-1/*'}}));
+  await assert.rejects(unknown.requestBytes('https://cdn.test/video'), /without its full size/);
+  let calls = 0;
+  const changed = load(async()=>{const start=calls++===0?0:2;return new Response(Uint8Array.of(1,2), {status:206,headers:{'Content-Range':`bytes ${start}-${start+1}/8`,ETag:calls===1?'"one"':'"two"'}});});
+  await assert.rejects(changed.requestBytes('https://cdn.test/video'), /different file/);
+  const large = load(async()=>new Response(Uint8Array.of(1,2), {status:206,headers:{'Content-Range':'bytes 0-1/20'}}));
+  await assert.rejects(large.requestBytes('https://cdn.test/video', {limit:10}), /memory limit/);
+  assert.throws(()=>api.partReply(Uint8Array.of(1), 'video/mp4', base, 206, '', '1', '', '', ''), /Content-Range/);
+  assert.throws(()=>api.partReply(Uint8Array.of(1), 'video/mp4', base, 200, '', '2', '', '', ''), /incomplete/);
+  assert.throws(()=>api.partReply(new Uint8Array(), '', base, 200, '', '0', '', '', ''), /empty/);
+});
+
+test('byte-range media segments assemble smaller server chunks without downloading unrelated bytes', async () => {
+  const bytes = Uint8Array.from({length:20}, (_,i)=>i);
+  const testApi = load(async(url,opts)=>{const [,a,b]=opts.headers.Range.match(/bytes=(\d+)-(\d+)/);const start=Number(a),end=Math.min(Number(b),start+2);return new Response(bytes.slice(start,end+1),{status:206,headers:{'Content-Range':`bytes ${start}-${end}/20`}});});
+  const result = await testApi.requestBytes('https://cdn.test/all', {range:{start:5,end:12}});
+  assert.deepEqual(Buffer.from(result.data), Buffer.from(bytes.slice(5,13)));
+});
+
+test('WebM finalization adds a finite duration and keeps the encoded media bytes intact', async () => {
+  const bytes = Uint8Array.from(Buffer.from('1a45dfa3801853806701ffffffffffffff1549a966872ad7b1830f42401f43b67583e78100','hex'));
+  const fixed = await api.fixWebm(new Blob([bytes], {type:'video/webm'}), 9);
+  const out = new Uint8Array(await fixed.blob.arrayBuffer());
+  assert.equal(new DataView(out.buffer).getFloat64(fixed.pos), 9000);
+  assert.deepEqual(Buffer.from(out.slice(fixed.head.length)), Buffer.from(bytes.slice(fixed.cut)));
+  const again = api.webmHead(out, 8.5);
+  assert.equal(again.head.length, fixed.head.length);
+  assert.equal(new DataView(again.head.buffer).getFloat64(again.pos), 8500);
+  assert.throws(()=>api.webmHead(Uint8Array.of(1,2,3),9), /WebM/);
+});
+
+test('recordings choose explicit compatible codecs and exclude paused time from file duration', () => {
+  const webm = load(undefined,{MediaRecorder:{isTypeSupported:t=>['video/mp4','video/webm;codecs=vp8,opus'].includes(t)}});
+  assert.equal(webm.recordMime({getVideoTracks:()=>[{}]}),'video/webm;codecs=vp8,opus');
+  const mp4 = load(undefined,{MediaRecorder:{isTypeSupported:t=>t==='video/mp4;codecs=avc1.42E01E,mp4a.40.2'}});
+  assert.equal(mp4.recordMime({getVideoTracks:()=>[{}]}),'video/mp4;codecs=avc1.42E01E,mp4a.40.2');
+  const clock = load(undefined,{performance:{now:()=>12000}});
+  assert.equal(clock.recordSecs({clock:1000,pauseMs:2000,pauseAt:0}),9);
+  assert.equal(clock.recordSecs({clock:1000,pauseMs:2000,pauseAt:10000}),7);
+});
+
+test('the detected container overrides a misleading download extension or MIME type', () => {
+  assert.equal(api.mediaExt(Uint8Array.of(0x1a,0x45,0xdf,0xa3),'video/mp4'),'webm');
+  assert.equal(api.mediaExt(Uint8Array.from(Buffer.from('0000001866747970','hex')),'video/webm'),'mp4');
 });
